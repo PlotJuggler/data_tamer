@@ -104,9 +104,12 @@ Unreleased
   ``docs/wire_format.md``. ``MCAPSink`` uses them. The caller provides the
   sequence number and a reusable scratch buffer (no allocation once it is large
   enough). They need ``data_tamer::data_tamer`` (and ``mcap_vendor::mcap`` under
-  ROS 2); outside ROS 2 the bundled MCAP headers are now installed and exported
-  with data_tamer, whose library already contains the MCAP implementation (do not
-  define ``MCAP_IMPLEMENTATION``). ``SerializeMe::Span<const T>`` converts from a
+  ROS 2); outside ROS 2 the bundled MCAP headers are now installed (under
+  ``include/data_tamer_mcap``) and exported with data_tamer through the
+  header-only ``data_tamer::mcap_headers`` target, so a shared install exports
+  no zstd/lz4 library paths; libdata_tamer already contains the MCAP
+  implementation (do not define ``MCAP_IMPLEMENTATION``). A shared build no
+  longer installs ``libmcap_lib.a``. ``SerializeMe::Span<const T>`` converts from a
   ``const std::vector<T>&``. The ``DataSink`` documentation now explains that a
   slow ``onSnapshot()`` exhausts the channel's shared snapshot pool for every sink.
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
