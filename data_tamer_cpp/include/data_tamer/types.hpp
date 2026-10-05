@@ -16,6 +16,8 @@ namespace DataTamer
 {
 
 constexpr int SCHEMA_VERSION = 5;
+/// Version of the YAML rendering of a schema (see ToYaml()).
+constexpr int SCHEMA_YAML_VERSION = 6;
 
 // clang-format off
 enum class BasicType: uint8_t
@@ -177,6 +179,14 @@ struct Schema
 };
 
 std::string ToStr(const Schema& schema);
+
+/**
+ * @brief The same schema as ToStr(), rendered as YAML (docs/wire_format.md,
+ * section 2.1). Field names that share a "/"-separated prefix are nested under
+ * it, which makes the text shorter when names are paths. Schema::hash is
+ * unchanged: it is always computed over the ToStr() text.
+ */
+std::string ToYaml(const Schema& schema);
 
 /**
  * @brief Hash of a schema text (see docs/wire_format.md, section 5): FNV-1a 64 over

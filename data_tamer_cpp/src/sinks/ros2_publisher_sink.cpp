@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <mutex>
-#include <sstream>
 #include <unordered_map>
 #include <utility>
 
@@ -95,9 +94,7 @@ void ROS2PublisherSink::onSchema(const Schema& schema)
   data_tamer_msgs::msg::Schema schema_msg;
   schema_msg.hash = schema.hash;
   schema_msg.channel_name = schema.channel_name;
-  std::ostringstream ss;
-  ss << schema;
-  schema_msg.schema_text = ss.str();
+  schema_msg.schema_text = _p->options.yaml_schemas ? ToYaml(schema) : ToStr(schema);
 
   std::lock_guard lock(_p->mutex);
   _p->schemas[schema.hash] = std::move(schema_msg);

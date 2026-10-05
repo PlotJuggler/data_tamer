@@ -8,6 +8,8 @@ line by line. Usage:
     values = parse_snapshot(schema, active_mask, payload)   # {"pose/position/x": 1.0, ...}
 
 For an MCAP message body written by MCAPSink use split_mcap_message() first.
+parse_schema() reads both schema renderings: the line format (version 5) and
+YAML (version 6); to_text() renders a schema back to the line format.
 For the ROS 2 messages of ROS2PublisherSink (data_tamer_msgs Schemas, Snapshot,
 SnapshotBatch) use SchemaRegistry, parse_snapshot_msg() and
 iter_snapshot_batch(); they only read message attributes, so they need no ROS
@@ -24,6 +26,7 @@ import struct
 from dataclasses import dataclass, field
 
 SCHEMA_VERSION = 5
+SCHEMA_YAML_VERSION = 6  # the YAML rendering of the same schema (spec section 2.1)
 _READABLE_VERSIONS = (4, 5)  # 4 differs only in how its hash was computed
 
 # Basic type name -> little-endian struct; the order is the BasicType id order.
@@ -88,9 +91,12 @@ def schema_hash(text: str) -> int:
 def parse_schema(text: str, verify_hash: bool = False) -> Schema:
     """Parse the schema text stored in the MCAP schema record / Schema.msg.
 
-    With verify_hash the declared hash must equal schema_hash(text); only version 5
-    texts can be verified.
+    Both renderings are accepted: the line format (versions 4 and 5) and YAML
+    (version 6), told apart by their first line. With verify_hash the declared
+    hash must equal the computed one (section 5); version 4 cannot be verified.
     """
+    if _first_line(text).startswith("version:"):
+        return _parse_schema_yaml(text, verify_hash)
     schema = Schema()
     lines = iter(text.splitlines())
     target = schema.fields
@@ -117,6 +123,198 @@ def parse_schema(text: str, verify_hash: bool = False) -> Schema:
         else:
             target.append(_parse_field_line(line))
     if verify_hash and schema.hash != schema_hash(text):
+        raise ValueError("schema hash does not match its text")
+    return schema
+
+
+def _first_line(text: str) -> str:
+    for raw in text.split("\n"):
+        line = raw.strip(" \r")
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def _field_line(f: Field) -> str:
+    if not f.is_vector:
+        return f"{f.type_name} {f.field_name}"
+    return f"{f.type_name}[{f.array_size or ''}] {f.field_name}"
+
+
+def to_text(schema: Schema) -> str:
+    """Render a schema in the version 5 line format, byte for byte as the C++
+    writer does; schema_hash() of the result is the schema hash (section 5)."""
+    sep = "=" * 59 + "\n"
+    out = [f"### version: {SCHEMA_VERSION}\n### hash: {schema.hash}\n"
+           f"### channel_name: {schema.channel_name}\n\n"]
+    out += [_field_line(f) + "\n" for f in schema.fields]
+    for name in sorted(schema.custom_types):
+        out.append(f"{sep}MSG: {name}\n")
+        out += [_field_line(f) + "\n" for f in schema.custom_types[name]]
+    for name in sorted(schema.custom_schemas):
+        encoding, body = schema.custom_schemas[name]
+        out.append(f"{sep}MSG: {name}\nENCODING: {encoding}\n{body}\n")
+    return "".join(out)
+
+
+# ---- YAML rendering (spec section 2.1) ----------------------------------------
+# Only the subset the writer emits is accepted: block mappings indented with
+# spaces, plain or double-quoted scalars, "{}" for an empty mapping and
+# full-line comments.
+
+_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+_HEX_ESCAPES = {"x": 2, "u": 4, "U": 8}
+
+
+def _read_quoted(s: str, line: str) -> tuple[str, str]:
+    """Decode the double-quoted scalar at the start of s; return (value, rest)."""
+    out, i = [], 1
+    while i < len(s):
+        c = s[i]
+        if c == '"':
+            return "".join(out), s[i + 1:]
+        if c == "\\":
+            e = s[i + 1:i + 2]
+            if e in _ESCAPES:
+                out.append(_ESCAPES[e])
+                i += 2
+            elif e in _HEX_ESCAPES:
+                n = _HEX_ESCAPES[e]
+                digits = s[i + 2:i + 2 + n]
+                if len(digits) != n:
+                    raise ValueError(f"bad escape in {line!r}")
+                out.append(chr(int(digits, 16)))
+                i += 2 + n
+            else:
+                raise ValueError(f"bad escape in {line!r}")
+        else:
+            out.append(c)
+            i += 1
+    raise ValueError(f"unterminated string in {line!r}")
+
+
+def _scalar(s: str, line: str) -> str:
+    if s.startswith('"'):
+        value, rest = _read_quoted(s, line)
+        if rest.strip():
+            raise ValueError(f"unexpected text after string in {line!r}")
+        return value
+    if s.startswith(("'", "[", "{", "&", "*", "!", "|", ">", "-", "?")) or " #" in s:
+        raise ValueError(f"unsupported YAML in {line!r}")
+    return s
+
+
+def _split_entry(content: str, line: str) -> tuple[str, str]:
+    """Split "key: value" / "key:" into (key, value text)."""
+    if content.startswith('"'):
+        key, rest = _read_quoted(content, line)
+        if not rest.startswith(":"):
+            raise ValueError(f"expected ':' after key in {line!r}")
+        rest = rest[1:]
+    else:
+        colon = content.find(": ")
+        if colon < 0:
+            if not content.endswith(":"):
+                raise ValueError(f"expected 'key: value' in {line!r}")
+            colon = len(content) - 1
+        key, rest = _scalar(content[:colon], line), content[colon + 1:]
+    if rest and not rest.startswith(" "):
+        raise ValueError(f"expected a space after ':' in {line!r}")
+    return key, rest.strip()
+
+
+# A node is (key, scalar, children); children is None for a scalar entry.
+def _parse_yaml_tree(text: str) -> list:
+    root: list = []
+    # (indent of the mapping's entries or None if not seen yet, entries, keys)
+    stack = [[0, root, set()]]
+    parent_indent = [-1]
+    for raw in text.split("\n"):
+        line = raw.rstrip(" \r")
+        content = line.lstrip(" ")
+        if not content or content.startswith("#"):
+            continue
+        if content.startswith("\t") or "\t" in line[:len(line) - len(content)]:
+            raise ValueError(f"tab indentation in {line!r}")
+        indent = len(line) - len(content)
+        while indent <= parent_indent[-1]:
+            stack.pop()
+            parent_indent.pop()
+        level = stack[-1]
+        if level[0] is None:
+            level[0] = indent
+        elif indent != level[0]:
+            raise ValueError(f"bad indentation in {line!r}")
+        key, rest = _split_entry(content, line)
+        if key in level[2]:
+            raise ValueError(f"duplicate key {key!r}")
+        level[2].add(key)
+        if rest == "":
+            children: list = []
+            level[1].append((key, None, children))
+            stack.append([None, children, set()])
+            parent_indent.append(indent)
+        elif rest == "{}":
+            level[1].append((key, None, []))
+        else:
+            level[1].append((key, _scalar(rest, line), None))
+    return root
+
+
+def _parse_type_spec(spec: str, name: str) -> Field:
+    bracket = spec.find("[")
+    if bracket < 0:
+        return Field(name, spec)
+    if not spec.endswith("]"):
+        raise ValueError(f"bad type {spec!r}")
+    inner = spec[bracket + 1:-1]
+    return Field(name, spec[:bracket], True, int(inner) if inner else 0)
+
+
+def _flatten(nodes: list, prefix: str, out: list[Field]) -> None:
+    for key, value, children in nodes:
+        if children is None:
+            out.append(_parse_type_spec(value, prefix + key))
+        else:
+            _flatten(children, prefix + key + "/", out)
+
+
+def _mapping(nodes: list) -> dict:
+    return {key: (value, children) for key, value, children in nodes}
+
+
+def _parse_schema_yaml(text: str, verify_hash: bool) -> Schema:
+    top = _mapping(_parse_yaml_tree(text))
+
+    def scalar(key: str) -> str:
+        if key not in top or top[key][0] is None:
+            raise ValueError(f"YAML schema: missing {key!r}")
+        return top[key][0]
+
+    def mapping(key: str, required: bool) -> list:
+        if key not in top:
+            if required:
+                raise ValueError(f"YAML schema: missing {key!r}")
+            return []
+        if top[key][1] is None:
+            raise ValueError(f"YAML schema: {key!r} must be a mapping")
+        return top[key][1]
+
+    if int(scalar("version")) != SCHEMA_YAML_VERSION:
+        raise ValueError(f"unsupported YAML schema version {scalar('version')!r}")
+    schema = Schema(channel_name=scalar("channel_name"), hash=int(scalar("hash")))
+    _flatten(mapping("fields", True), "", schema.fields)
+    for type_name, value, children in mapping("types", False):
+        if children is None:
+            raise ValueError(f"YAML schema: type {type_name!r} must be a mapping")
+        _flatten(children, "", schema.custom_types.setdefault(type_name, []))
+    for type_name, value, children in mapping("opaque_types", False):
+        entry = _mapping(children or [])
+        encoding, body = entry.get("encoding", (None,))[0], entry.get("schema", (None,))[0]
+        if encoding is None or body is None:
+            raise ValueError(f"YAML schema: opaque type {type_name!r} needs encoding and schema")
+        schema.custom_schemas[type_name] = (encoding, body)
+    if verify_hash and schema.hash != schema_hash(to_text(schema)):
         raise ValueError("schema hash does not match its text")
     return schema
 

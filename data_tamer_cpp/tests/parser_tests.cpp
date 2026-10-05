@@ -518,3 +518,64 @@ TEST(DataTamerParser, SnapshotBatchHelpers)
                                                     [](const auto&, const auto&) {}),
             0u);
 }
+
+TEST(DataTamerParser, YamlSchemaRoundTrip)
+{
+  DataTamer::Schema schema;
+  schema.channel_name = "yaml";
+  schema.fields = { { "a/b/c", DataTamer::BasicType::FLOAT64, "", false, 0 },
+                    { "a/b/d", DataTamer::BasicType::INT32, "", true, 0 },
+                    { "a/e", DataTamer::BasicType::OTHER, "Custom Type", true, 3 },
+                    { "x", DataTamer::BasicType::UINT8, "", false, 0 } };
+  schema.custom_types["Custom Type"] = { { "v", DataTamer::BasicType::BOOL, "", false,
+                                           0 } };
+  schema.custom_schemas["Blob"] = { "proto\"buf", "line 1\n\tline \"2\"\x01\nlast" };
+  schema.hash = DataTamer::ComputeSchemaHash(schema);
+
+  const auto yaml = DataTamer::ToYaml(schema);
+  const auto parsed = BuildSchemaFromText(yaml, true);
+  EXPECT_EQ(parsed.hash, schema.hash);
+  ASSERT_EQ(parsed.fields.size(), 4u);
+  EXPECT_EQ(parsed.fields[0].field_name, "a/b/c");
+  EXPECT_EQ(parsed.fields[1].field_name, "a/b/d");
+  EXPECT_TRUE(parsed.fields[1].is_vector);
+  EXPECT_EQ(parsed.fields[2].type_name, "Custom Type");
+  EXPECT_EQ(parsed.fields[2].array_size, 3u);
+  EXPECT_EQ(parsed.fields[3].type, BasicType::UINT8);
+  ASSERT_EQ(parsed.custom_schemas.count("Blob"), 1u);
+  EXPECT_EQ(parsed.custom_schemas.at("Blob").encoding, "proto\"buf");
+  EXPECT_EQ(parsed.custom_schemas.at("Blob").schema, "line 1\n\tline \"2\"\x01\nlast");
+  EXPECT_EQ(ToText(parsed), DataTamer::ToStr(schema));
+
+  // empty mappings
+  DataTamer::Schema empty;
+  empty.channel_name = "empty";
+  empty.hash = DataTamer::ComputeSchemaHash(empty);
+  EXPECT_TRUE(BuildSchemaFromText(DataTamer::ToYaml(empty), true).fields.empty());
+}
+
+TEST(DataTamerParser, YamlSchemaRejectsMalformedInput)
+{
+  const std::string head = "version: 6\nhash: 1\nchannel_name: c\n";
+  EXPECT_THROW(BuildSchemaFromText("version: 7\nhash: 1\nchannel_name: c\nfields: {}\n"),
+               std::runtime_error);
+  EXPECT_THROW(BuildSchemaFromText(head), std::runtime_error);  // no fields
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  a: float64\n  a: int8\n"),
+               std::runtime_error);  // duplicate key
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  a: float64\n   b: int8\n"),
+               std::runtime_error);  // indentation
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  a: [float64]\n"),
+               std::runtime_error);  // flow sequence
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  \"a: float64\n"),
+               std::runtime_error);  // unterminated string
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  a: int32[0]\n"),
+               std::runtime_error);
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  a: float64\n", true),
+               std::runtime_error);  // wrong hash
+  std::string deep = head + "fields:\n";
+  for(int i = 0; i < 100; i++)
+  {
+    deep += std::string(size_t(2 * (i + 1)), ' ') + "k:\n";
+  }
+  EXPECT_THROW(BuildSchemaFromText(deep), std::runtime_error);
+}

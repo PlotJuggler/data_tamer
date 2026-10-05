@@ -23,6 +23,7 @@ Python decoder, and describe the change in this file.
 
 | Version | Change |
 |---:|---|
+| 6 | YAML rendering of the version 5 schema (section 2.1), opt-in. Same hash. |
 | 5 | Hash defined as FNV-1a 64 of the schema text; covers custom type bodies. |
 | 4 | Lower-case type names, `MSG:` sections. Hash was `std::hash` based. |
 
@@ -128,6 +129,86 @@ Grammar, in the order lines appear:
    by user code; this document does not define them and generic decoders
    cannot skip them. Producers that need generic decoding must not use them.
 
+### 2.1 YAML rendering (version 6)
+
+The same schema can be written as YAML. It is opt-in (`ToYaml()`;
+`ROS2PublisherOptions::yaml_schemas`); MCAP files keep the line format. When
+field names are `/`-separated paths it is shorter, because a shared prefix is
+written once (`schema_nested.txt` vs `schema_nested.yaml` in the vectors
+directory):
+
+```yaml
+version: 6
+hash: 8022624192411902335
+channel_name: "nested test"
+fields:
+  arm:
+    joint_1:
+      position: float64
+      velocity: float64
+    mode: uint8
+  state: uint8
+  arm/late: float64
+  "7up":
+    x: float64
+    "y": float64
+  cart/pose: Pose
+types:
+  Pose:
+    position: Point3D
+    stamp: uint32
+```
+
+Decoders tell the renderings apart by the first line that is neither empty nor
+a `#` comment: `version:` starts YAML, `### ` the line format.
+
+Content:
+
+- `version` (6), `hash` (decimal uint64, the hash of section 5 — the same value
+  the line format of this schema carries) and `channel_name`.
+- `fields`: the top-level fields, **in document order**, which is the mask bit
+  order and the payload order. Generic YAML loaders that keep insertion order
+  (PyYAML, Python dicts, yaml-cpp) read it correctly; ones that sort keys do not.
+- `types` (omitted when empty): one mapping per custom type, same rules as
+  `fields`.
+- `opaque_types` (omitted when empty): one mapping per opaque custom type with
+  `encoding` and `schema` (the foreign schema text, double-quoted). Any number
+  of opaque types is allowed here.
+
+An entry `key: <type-spec>` is a field; `type-spec` is as in section 2. An entry
+`key:` followed by more-indented entries is a group: the name of every field
+inside is `key/` + its name in the group, recursively, so a field's name is the
+path of keys from `fields` (or from its type) joined with `/`. A key may itself
+contain `/`. An empty mapping is written `{}`.
+
+The writer nests a run of **two or more consecutive** fields whose names share
+the first path segment, unless that segment is already a key of the same
+mapping (a field with that exact name, or an earlier run); those fields keep
+their relative name as a flat key (`arm/late` above). It nests at most 16
+levels. Decoders must not rely on these choices: only the keys define the names.
+
+Syntax is a strict subset of YAML 1.2 that YAML 1.1 loaders read the same way:
+
+- Block mappings only, indented with spaces (the writer uses 2 per level;
+  siblings must share their indentation). No tabs, sequences, flow collections
+  other than `{}`, anchors, tags, multi-line scalars or trailing comments.
+  Full-line `#` comments are allowed.
+- A key or value is plain when it matches `[A-Za-z_][A-Za-z0-9_./-]*` (keys,
+  names) or `[A-Za-z_][A-Za-z0-9_]*(\[[0-9]*\])?` (type specs) and is not, in
+  lower case, one of `y n yes no on off true false null`. Otherwise it is
+  double-quoted with the escapes `\" \\ \n \t \r \xHH` (the writer uses `\xHH`
+  for the remaining control characters; decoders also accept `\/ \0 \uHHHH
+  \UHHHHHHHH`). Other characters are written as UTF-8.
+- Duplicate keys in a mapping are an error. Decoders bound the nesting depth
+  (the reference decoders reject more than 64 levels).
+
+To verify the hash of a YAML schema, render it back to the line format of
+section 2 (field lines in order, custom types then opaque types sorted by name
+in byte order, separators of 59 `=`) and apply section 5 to that text; both
+reference decoders do this (`ToText()`, `to_text()`).
+
+### Legacy
+
 Legacy files (version < 4, before 2023) used upper-case type names (`DOUBLE`,
 `INT32`, ...) with the name first; the C++ parser still accepts them, new
 decoders may ignore that.
@@ -220,6 +301,8 @@ Topics under a user-chosen prefix:
   were taken. When `embed_schemas` is set (the default), `schemas` holds the
   schema of every snapshot in the batch, each once, so a batch decodes on its
   own; otherwise it is empty and the `schemas` topic is needed.
+- With `yaml_schemas`, every `schema_text` (on both topics) is the YAML
+  rendering of section 2.1.
 
 `ForEachSnapshotInBatch()` (C++ parser) and `iter_snapshot_batch()` (Python)
 decode a `SnapshotBatch`, using a `SchemaRegistry` filled from the embedded
@@ -302,6 +385,8 @@ same relative position.
 A decoder conforms when it reproduces `expected.json` from the vectors
 directory the way `python/test_data_tamer_parser.py` does: parse `schema.txt`
 and recompute its hash,
+parse `schema.yaml` and `schema_nested.yaml` (if it reads version 6) to the
+same schemas as `schema.txt` and `schema_nested.txt`, hashes included,
 decode both snapshots from mask and payload (disabled fields absent, not zero;
 floats compared bit-exactly), split both `.mcap_message` bodies into the same
 mask and payload bytes, and reject a payload with trailing bytes or a schema

@@ -18,6 +18,8 @@ namespace DataTamerParser
 {
 
 constexpr int SCHEMA_VERSION = 5;
+/// The YAML rendering of a schema (wire format, section 2.1).
+constexpr int SCHEMA_YAML_VERSION = 6;
 
 enum class BasicType : uint8_t
 {
@@ -81,6 +83,13 @@ using FieldsVector = std::vector<TypeField>;
 /**
  * @brief DataTamer uses a simple "flat" schema of key/value pairs (each pair is a "field").
  */
+/// A custom type whose layout is described in a foreign schema language.
+struct CustomSchema
+{
+  std::string encoding;
+  std::string schema;
+};
+
 struct Schema
 {
   uint64_t hash = 0;
@@ -88,6 +97,8 @@ struct Schema
   std::string channel_name;
 
   std::map<std::string, FieldsVector> custom_types;
+  /// Opaque custom types; filled only from YAML schemas (version 6).
+  std::map<std::string, CustomSchema> custom_schemas;
 };
 
 struct SnapshotView
@@ -305,6 +316,443 @@ inline bool TypeField::operator!=(const TypeField& other) const
   return !(*this == other);
 }
 
+/// Renders a schema in the version 5 line format, byte for byte as the
+/// DataTamer writer does: SchemaTextHash() of the result is the schema hash.
+inline std::string ToText(const Schema& schema)
+{
+  auto fieldLine = [](const TypeField& field) {
+    std::string line = field.type_name;
+    if(field.is_vector)
+    {
+      line += field.array_size == 0 ? "[]" : "[" + std::to_string(field.array_size) + "]";
+    }
+    return line + " " + field.field_name + "\n";
+  };
+  const std::string separator(59, '=');
+  std::string out = "### version: " + std::to_string(SCHEMA_VERSION) +
+                    "\n### hash: " + std::to_string(schema.hash) +
+                    "\n### channel_name: " + schema.channel_name + "\n\n";
+  for(const auto& field : schema.fields)
+  {
+    out += fieldLine(field);
+  }
+  for(const auto& [type_name, fields] : schema.custom_types)
+  {
+    out += separator + "\nMSG: " + type_name + "\n";
+    for(const auto& field : fields)
+    {
+      out += fieldLine(field);
+    }
+  }
+  for(const auto& [type_name, custom] : schema.custom_schemas)
+  {
+    out += separator + "\nMSG: " + type_name + "\nENCODING: " + custom.encoding + "\n" +
+           custom.schema + "\n";
+  }
+  return out;
+}
+
+namespace detail
+{
+/// Deeper YAML nesting is rejected (the writer nests at most 16 levels).
+constexpr size_t kMaxYamlDepth = 64;
+
+struct YamlNode
+{
+  std::string key;
+  std::optional<std::string> scalar;  // empty for a mapping
+  std::vector<YamlNode> children;
+};
+
+[[noreturn]] inline void YamlError(const std::string& what, const std::string& line)
+{
+  throw std::runtime_error("DataTamerParser: YAML schema: " + what + " in: " + line);
+}
+
+inline void AppendUtf8(std::string& out, uint32_t cp)
+{
+  if(cp < 0x80)
+  {
+    out += char(cp);
+  }
+  else if(cp < 0x800)
+  {
+    out += char(0xC0 | (cp >> 6));
+    out += char(0x80 | (cp & 0x3F));
+  }
+  else if(cp < 0x10000)
+  {
+    out += char(0xE0 | (cp >> 12));
+    out += char(0x80 | ((cp >> 6) & 0x3F));
+    out += char(0x80 | (cp & 0x3F));
+  }
+  else
+  {
+    out += char(0xF0 | (cp >> 18));
+    out += char(0x80 | ((cp >> 12) & 0x3F));
+    out += char(0x80 | ((cp >> 6) & 0x3F));
+    out += char(0x80 | (cp & 0x3F));
+  }
+}
+
+/// Decodes the double-quoted scalar starting at s[pos] == '"'; returns the
+/// index just past the closing quote.
+inline size_t ReadQuoted(const std::string& s, size_t pos, std::string& out,
+                         const std::string& line)
+{
+  out.clear();
+  size_t i = pos + 1;
+  while(i < s.size())
+  {
+    const char c = s[i];
+    if(c == '"')
+    {
+      return i + 1;
+    }
+    if(c != '\\')
+    {
+      out += c;
+      i++;
+      continue;
+    }
+    if(i + 1 >= s.size())
+    {
+      break;
+    }
+    const char e = s[i + 1];
+    size_t digits = 0;
+    switch(e)
+    {
+      case '"':
+      case '\\':
+      case '/':
+        out += e;
+        break;
+      case 'n':
+        out += '\n';
+        break;
+      case 't':
+        out += '\t';
+        break;
+      case 'r':
+        out += '\r';
+        break;
+      case '0':
+        out += '\0';
+        break;
+      case 'x':
+        digits = 2;
+        break;
+      case 'u':
+        digits = 4;
+        break;
+      case 'U':
+        digits = 8;
+        break;
+      default:
+        YamlError("bad escape", line);
+    }
+    i += 2;
+    if(digits > 0)
+    {
+      const std::string hex = s.substr(i, digits);
+      if(hex.size() != digits ||
+         hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+      {
+        YamlError("bad escape", line);
+      }
+      const auto cp = static_cast<uint32_t>(std::stoul(hex, nullptr, 16));
+      if(cp > 0x10FFFF)
+      {
+        YamlError("bad escape", line);
+      }
+      AppendUtf8(out, cp);
+      i += digits;
+    }
+  }
+  YamlError("unterminated string", line);
+}
+
+inline std::string YamlScalar(const std::string& s, const std::string& line)
+{
+  if(!s.empty() && s.front() == '"')
+  {
+    std::string value;
+    const size_t end = ReadQuoted(s, 0, value, line);
+    if(s.find_first_not_of(' ', end) != std::string::npos)
+    {
+      YamlError("unexpected text after string", line);
+    }
+    return value;
+  }
+  if(s.empty() || std::string("'[{&*!|>-?").find(s.front()) != std::string::npos ||
+     s.find(" #") != std::string::npos)
+  {
+    YamlError("unsupported YAML", line);
+  }
+  return s;
+}
+
+/// Splits "key: value" or "key:" into the key and the trimmed value text.
+inline std::pair<std::string, std::string> SplitYamlEntry(const std::string& content,
+                                                          const std::string& line)
+{
+  std::string key;
+  std::string rest;
+  if(content.front() == '"')
+  {
+    const size_t end = ReadQuoted(content, 0, key, line);
+    if(end >= content.size() || content[end] != ':')
+    {
+      YamlError("expected ':' after key", line);
+    }
+    rest = content.substr(end + 1);
+  }
+  else
+  {
+    size_t colon = content.find(": ");
+    if(colon == std::string::npos)
+    {
+      if(content.back() != ':')
+      {
+        YamlError("expected 'key: value'", line);
+      }
+      colon = content.size() - 1;
+    }
+    key = YamlScalar(content.substr(0, colon), line);
+    rest = content.substr(colon + 1);
+  }
+  if(!rest.empty() && rest.front() != ' ')
+  {
+    YamlError("expected a space after ':'", line);
+  }
+  const auto first = rest.find_first_not_of(' ');
+  rest = first == std::string::npos ? std::string() : rest.substr(first);
+  return { key, rest };
+}
+
+/// Parses the block-mapping subset of YAML written by DataTamer::ToYaml().
+inline std::vector<YamlNode> ParseYamlTree(const std::string& txt)
+{
+  struct Level
+  {
+    int parent_indent;
+    std::optional<int> indent;  // indentation of this mapping's entries
+    std::vector<YamlNode>* entries;
+  };
+  std::vector<YamlNode> root;
+  std::vector<Level> stack = { { -1, std::nullopt, &root } };
+
+  std::istringstream ss(txt);
+  std::string line;
+  while(std::getline(ss, line))
+  {
+    while(!line.empty() && (line.back() == ' ' || line.back() == '\r'))
+    {
+      line.pop_back();
+    }
+    const size_t first = line.find_first_not_of(' ');
+    if(first == std::string::npos || line[first] == '#')
+    {
+      continue;
+    }
+    if(line[first] == '\t')
+    {
+      YamlError("tab indentation", line);
+    }
+    const int indent = int(first);
+    while(indent <= stack.back().parent_indent)
+    {
+      stack.pop_back();
+    }
+    Level& level = stack.back();
+    if(!level.indent)
+    {
+      level.indent = indent;
+    }
+    else if(*level.indent != indent)
+    {
+      YamlError("bad indentation", line);
+    }
+    auto [key, rest] = SplitYamlEntry(line.substr(first), line);
+    for(const auto& sibling : *level.entries)
+    {
+      if(sibling.key == key)
+      {
+        YamlError("duplicate key", line);
+      }
+    }
+    YamlNode node;
+    node.key = std::move(key);
+    if(!rest.empty() && rest != "{}")
+    {
+      node.scalar = YamlScalar(rest, line);
+    }
+    level.entries->push_back(std::move(node));
+    if(rest.empty())
+    {
+      if(stack.size() > kMaxYamlDepth)
+      {
+        YamlError("nesting too deep", line);
+      }
+      stack.push_back({ indent, std::nullopt, &level.entries->back().children });
+    }
+  }
+  return root;
+}
+
+inline TypeField ParseYamlTypeSpec(const std::string& spec)
+{
+  static const std::array<std::string, TypesCount> kNames = {
+    "bool",   "char",  "int8",   "uint8",   "int16",   "uint16", "int32",
+    "uint32", "int64", "uint64", "float32", "float64", "other"
+  };
+  TypeField field;
+  const auto bracket = spec.find('[');
+  field.type_name = spec.substr(0, bracket);
+  if(field.type_name.empty())
+  {
+    throw std::runtime_error("DataTamerParser: YAML schema: empty type");
+  }
+  for(size_t i = 0; i + 1 < TypesCount; i++)
+  {
+    if(field.type_name == kNames[i])
+    {
+      field.type = static_cast<BasicType>(i);
+    }
+  }
+  if(bracket != std::string::npos)
+  {
+    field.is_vector = true;
+    const std::string inner = spec.substr(bracket + 1, spec.size() - bracket - 2);
+    if(spec.back() != ']' || inner.find_first_not_of("0123456789") != std::string::npos)
+    {
+      throw std::runtime_error("DataTamerParser: YAML schema: invalid type " + spec);
+    }
+    if(!inner.empty())
+    {
+      const unsigned long long extent = std::stoull(inner);
+      if(extent == 0 || extent > 65535)
+      {
+        throw std::runtime_error("DataTamerParser: YAML schema: array size out of "
+                                 "range (1..65535) in " +
+                                 spec);
+      }
+      field.array_size = static_cast<uint16_t>(extent);
+    }
+  }
+  return field;
+}
+
+inline void FlattenYamlFields(const std::vector<YamlNode>& nodes,
+                              const std::string& prefix, FieldsVector& out)
+{
+  for(const auto& node : nodes)
+  {
+    if(node.scalar)
+    {
+      TypeField field = ParseYamlTypeSpec(*node.scalar);
+      field.field_name = prefix + node.key;
+      out.push_back(std::move(field));
+    }
+    else
+    {
+      FlattenYamlFields(node.children, prefix + node.key + "/", out);
+    }
+  }
+}
+
+inline const YamlNode* FindYamlKey(const std::vector<YamlNode>& nodes,
+                                   const std::string& key)
+{
+  for(const auto& node : nodes)
+  {
+    if(node.key == key)
+    {
+      return &node;
+    }
+  }
+  return nullptr;
+}
+}  // namespace detail
+
+/// Parses a YAML schema (version 6, wire format section 2.1). BuildSchemaFromText()
+/// calls it when the text starts with "version:".
+inline Schema BuildSchemaFromYaml(const std::string& txt, bool check_hash = false)
+{
+  using detail::FindYamlKey;
+  const auto root = detail::ParseYamlTree(txt);
+  auto scalar = [&](const std::string& key) -> const std::string& {
+    const auto* node = FindYamlKey(root, key);
+    if(!node || !node->scalar)
+    {
+      throw std::runtime_error("DataTamerParser: YAML schema: missing " + key);
+    }
+    return *node->scalar;
+  };
+  auto mapping = [&](const std::string& key, bool required) {
+    const auto* node = FindYamlKey(root, key);
+    if(node && node->scalar)
+    {
+      throw std::runtime_error("DataTamerParser: YAML schema: " + key +
+                               " must be a mapping");
+    }
+    if(!node && required)
+    {
+      throw std::runtime_error("DataTamerParser: YAML schema: missing " + key);
+    }
+    return node ? &node->children : nullptr;
+  };
+  auto toUint = [](const std::string& value, const char* what) {
+    if(value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+    {
+      throw std::runtime_error(std::string("DataTamerParser: YAML schema: invalid ") +
+                               what);
+    }
+    return std::stoull(value);
+  };
+
+  if(toUint(scalar("version"), "version") != SCHEMA_YAML_VERSION)
+  {
+    throw std::runtime_error("Wrong SCHEMA_VERSION");
+  }
+  Schema schema;
+  schema.hash = toUint(scalar("hash"), "hash");
+  schema.channel_name = scalar("channel_name");
+  detail::FlattenYamlFields(*mapping("fields", true), "", schema.fields);
+  if(const auto* types = mapping("types", false))
+  {
+    for(const auto& type : *types)
+    {
+      if(type.scalar)
+      {
+        throw std::runtime_error("DataTamerParser: YAML schema: type " + type.key +
+                                 " must be a mapping");
+      }
+      detail::FlattenYamlFields(type.children, "", schema.custom_types[type.key]);
+    }
+  }
+  if(const auto* opaque = mapping("opaque_types", false))
+  {
+    for(const auto& type : *opaque)
+    {
+      const auto* encoding = FindYamlKey(type.children, "encoding");
+      const auto* body = FindYamlKey(type.children, "schema");
+      if(!encoding || !encoding->scalar || !body || !body->scalar)
+      {
+        throw std::runtime_error("DataTamerParser: YAML schema: opaque type " + type.key +
+                                 " needs encoding and schema");
+      }
+      schema.custom_schemas[type.key] = { *encoding->scalar, *body->scalar };
+    }
+  }
+  if(check_hash && schema.hash != SchemaTextHash(ToText(schema)))
+  {
+    throw std::runtime_error("Error in hash calculation");
+  }
+  return schema;
+}
+
 inline Schema BuildSchemaFromText(const std::string& txt, bool check_hash = false)
 {
   auto trimString = [](std::string& str) {
@@ -317,6 +765,28 @@ inline Schema BuildSchemaFromText(const std::string& txt, bool check_hash = fals
       str.erase(0, 1);
     }
   };
+
+  {
+    // The YAML rendering (version 6) starts with "version:"; the line format with "###".
+    std::istringstream probe(txt);
+    std::string first;
+    while(std::getline(probe, first))
+    {
+      trimString(first);
+      if(!first.empty() && first.front() != '#')
+      {
+        break;
+      }
+      if(first.rfind("###", 0) == 0)
+      {
+        break;
+      }
+    }
+    if(first.rfind("version:", 0) == 0)
+    {
+      return BuildSchemaFromYaml(txt, check_hash);
+    }
+  }
 
   std::istringstream ss(txt);
   std::string line;

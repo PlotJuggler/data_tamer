@@ -245,6 +245,50 @@ TEST(DataTamerROS2Publisher, AggregateFlushWithoutSchemas)
   EXPECT_TRUE(batch->schemas.empty());
 }
 
+TEST(DataTamerROS2Publisher, AggregateWithYamlSchemas)
+{
+  auto node = std::make_shared<rclcpp::Node>("test_datatamer_aggregate_yaml");
+  ROS2PublisherOptions options;
+  options.aggregate = true;
+  options.max_batch_size = 2;
+  options.yaml_schemas = true;
+  auto ros2_sink = ROS2PublisherSink::create(node, "test_aggregate_yaml", options);
+
+  auto channel = ChannelsRegistry::Global().getChannel("channel_aggregate_yaml");
+  channel->addDataSink(ros2_sink);
+  double const value = 3.;
+  channel->registerValue("robot/arm/value", &value);
+  channel->registerValue("robot/arm/other", &value);
+
+  auto batch = receiveBatch(node, "test_aggregate_yaml", [&] {
+    for(int i = 0; i < 2; i++)
+    {
+      ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+    }
+    ros2_sink->drain();
+  });
+
+  ASSERT_TRUE(batch.has_value());
+  ASSERT_EQ(batch->schemas.size(), 1u);
+  EXPECT_EQ(batch->schemas[0].schema_text, ToYaml(channel->getSchema()));
+
+  DataTamerParser::SchemaRegistry registry;
+  std::vector<std::string> names;
+  EXPECT_EQ(DataTamerParser::ForEachSnapshotInBatch(
+                registry, *batch,
+                [&](const DataTamerParser::Schema& schema,
+                    const DataTamerParser::SnapshotView& view) {
+                  DataTamerParser::ParseSnapshot(
+                      schema, view,
+                      [&](const std::string& name, const DataTamerParser::VarNumber&) {
+                        names.push_back(name);
+                      });
+                }),
+            2u);
+  EXPECT_EQ(names.size(), 4u);
+  EXPECT_EQ(names.front(), "robot/arm/value");
+}
+
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);

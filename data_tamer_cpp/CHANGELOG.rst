@@ -18,6 +18,14 @@ Unreleased
   filled from ``Schemas`` or embedded batch schemas), ``ToSnapshotView()`` and
   ``ForEachSnapshotInBatch()``. Python equivalents in ``data_tamer_parser.py``:
   ``SchemaRegistry``, ``parse_snapshot_msg()`` and ``iter_snapshot_batch()``.
+* YAML schema rendering (wire format version 6, section 2.1): ``ToYaml(schema)``
+  writes the same schema as YAML, nesting fields whose names share a
+  ``/``-separated prefix, which is shorter for path-like names (the hash is
+  unchanged). Opt in for ROS with ``ROS2PublisherOptions::yaml_schemas``.
+  ``BuildSchemaFromText()`` and the Python ``parse_schema()`` detect and read
+  both renderings without dependencies, and verify a YAML schema's hash via
+  ``ToText()`` / ``to_text()``. The parser's ``Schema`` gains
+  ``custom_schemas`` (opaque types, filled from YAML).
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /

@@ -49,6 +49,68 @@ class GoldenVectors(unittest.TestCase):
             dt.parse_schema("### version: 5\n### hash: 1\n### channel_name: x\n", verify_hash=True)
 
 
+class YamlSchema(unittest.TestCase):
+    """The YAML rendering (version 6) decodes to the same schema as the line format."""
+
+    def assert_same(self, stem: str):
+        text = read(stem + ".txt").decode()
+        yaml_text = read(stem + ".yaml").decode()
+        from_text = dt.parse_schema(text, verify_hash=True)
+        from_yaml = dt.parse_schema(yaml_text, verify_hash=True)
+        self.assertEqual(from_yaml, from_text)
+        self.assertEqual(dt.to_text(from_yaml), text)
+        return from_yaml
+
+    def test_golden_schema(self):
+        schema = self.assert_same("schema")
+        mask, payload = read("snapshot_full.mask"), read("snapshot_full.payload")
+        self.assertEqual(dt.parse_snapshot(schema, mask, payload),
+                         json.loads(read("expected.json"))["full"])
+
+    def test_nested_schema(self):
+        schema = self.assert_same("schema_nested")
+        self.assertEqual(schema.channel_name, "nested test")
+        names = [f.field_name for f in schema.fields]
+        self.assertEqual(names[:5], ["arm/joint_1/position", "arm/joint_1/velocity",
+                                     "arm/joint_2/position", "arm/joint_2/velocity", "arm/mode"])
+        self.assertIn("on", names)
+        self.assertIn("7up/y", names)
+        self.assertLess(len(read("schema_nested.yaml")), len(read("schema_nested.txt")))
+
+    def test_quoted_scalars_and_opaque_types(self):
+        text = ('version: 6\nhash: 0\nchannel_name: "a \\"b\\""\nfields:\n'
+                '  "x y":\n    "1": "Blob[2]"\n'
+                'opaque_types:\n  Blob:\n    encoding: proto\n    schema: "l1\\n\\tl2\\x01\\u00e9"\n')
+        schema = dt.parse_schema(text)
+        self.assertEqual(schema.channel_name, 'a "b"')
+        self.assertEqual(schema.fields, [dt.Field("x y/1", "Blob", True, 2)])
+        self.assertEqual(schema.custom_schemas, {"Blob": ("proto", "l1\n\tl2\x01\u00e9")})
+
+    def test_rejects_malformed_yaml(self):
+        head = "version: 6\nhash: 1\nchannel_name: c\n"
+        for bad in ["version: 7\nhash: 1\nchannel_name: c\nfields: {}\n",
+                    head,                                            # no fields
+                    head + "fields:\n  a: float64\n  a: int8\n",     # duplicate key
+                    head + "fields:\n  a: float64\n   b: int8\n",    # indentation
+                    head + "fields:\n  a: [float64]\n",              # flow sequence
+                    head + 'fields:\n  "a: float64\n']:              # unterminated
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                dt.parse_schema(bad)
+        with self.assertRaises(ValueError):
+            dt.parse_schema(head + "fields:\n  a: float64\n", verify_hash=True)
+
+    def test_generic_yaml_loader_agrees(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        doc = yaml.safe_load(read("schema_nested.yaml"))
+        self.assertEqual(doc["version"], dt.SCHEMA_YAML_VERSION)
+        self.assertEqual(list(doc["fields"]["arm"]), ["joint_1", "joint_2", "mode"])
+        self.assertEqual(doc["fields"]["7up"], {"x": "float64", "y": "float64"})
+        self.assertEqual(doc["fields"]["on"], "uint8")
+
+
 class RosMessageHelpers(unittest.TestCase):
     """SnapshotBatch decoding, with stand-ins that have the data_tamer_msgs attributes."""
 
