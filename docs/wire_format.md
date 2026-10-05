@@ -134,10 +134,12 @@ Grammar, in the order lines appear:
 ### 2.1 YAML rendering (version 6)
 
 The same schema can be written as YAML. It is opt-in (`ToYaml()`;
-`ROS2PublisherOptions::schema_format = SchemaFormat::Yaml`); MCAP files keep the line format. When
-field names are `/`-separated paths it is shorter, because a shared prefix is
-written once (`schema_nested.txt` vs `schema_nested.yaml` in the vectors
-directory):
+`ROS2PublisherOptions::schema_format = SchemaFormat::Yaml`); MCAP files keep
+the line format. When field names are `/`-separated paths it is shorter,
+because a shared prefix is written once (`schema_nested.txt` vs
+`schema_nested.yaml` in the vectors directory). An excerpt of
+`schema_nested.yaml` (some fields and the `Point3D` type are left out, so
+`hash` is that of the complete file, not of the excerpt):
 
 ```yaml
 version: 6
@@ -161,8 +163,9 @@ types:
     stamp: uint32
 ```
 
-Decoders tell the renderings apart by the first line that is neither empty nor
-a `#` comment: `version:` starts YAML, `### ` the line format.
+Decoders tell the renderings apart by their first non-empty line: the line
+format starts with `### version:`, YAML with `version:` (a YAML text may be
+preceded by `#` comment lines that do not start with `###`).
 
 Content:
 
@@ -307,12 +310,14 @@ Topics under a user-chosen prefix:
   `uint64 schema_hash`, `uint8[] active_mask`, `uint8[] payload`.
 - `<prefix>/data_batch`, type `data_tamer_msgs/msg/SnapshotBatch`, instead of
   `<prefix>/data` when `ROS2PublisherOptions::aggregate` is set (same QoS):
-  `Schema[] schemas`, `Snapshot[] snapshots`. Snapshots are in the order they
-  were taken. When `embed_schemas` is set (the default), `schemas` holds the
-  schema of every snapshot in the batch, each once, so a batch decodes on its
-  own; otherwise it is empty and the `schemas` topic is needed.
-- With `schema_format = SchemaFormat::Yaml`, every `schema_text` (on both topics) is the YAML
-  rendering of section 2.1.
+  `Schema[] schemas`, `Snapshot[] snapshots`. Snapshots are in the order the
+  sink received them: the snapshots of one channel are in the order they were
+  taken, but snapshots of different channels may interleave out of
+  `timestamp_nsec` order. When `embed_schemas` is set (the default), `schemas`
+  holds the schema of every snapshot in the batch, each once, so a batch
+  decodes on its own; otherwise it is empty and the `schemas` topic is needed.
+- With `schema_format = SchemaFormat::Yaml`, every `schema_text` (on both
+  topics) is the YAML rendering of section 2.1.
 
 `ForEachSnapshotInBatch()` (C++ parser) and `iter_snapshot_batch()` (Python)
 decode a `SnapshotBatch`, using a `SchemaRegistry` filled from the embedded

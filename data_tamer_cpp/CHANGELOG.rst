@@ -4,6 +4,9 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* ROS 2: export the ``Threads`` dependency, so that ``find_package(data_tamer_cpp)``
+  works from a fresh CMake cache (``Threads::Threads`` is in the public link
+  interface).
 * ``ROS2PublisherSink`` can aggregate snapshots: pass ``ROS2PublisherOptions``
   with ``aggregate = true`` to publish ``data_tamer_msgs/SnapshotBatch`` on
   ``<prefix>/data_batch`` instead of one ``Snapshot`` per sample on

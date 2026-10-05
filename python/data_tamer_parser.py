@@ -90,7 +90,10 @@ def _parse_field_line(line: str) -> Field:
 def _parse_uint(value: str, what: str) -> int:
     if not value or len(value) > 20 or not all(c in "0123456789" for c in value):
         raise ValueError(f"invalid {what} {value!r}")
-    return int(value)
+    number = int(value)
+    if number > 0xFFFFFFFFFFFFFFFF:  # as the C++ reader: it must fit in a uint64
+        raise ValueError(f"invalid {what} {value!r}")
+    return number
 
 
 def schema_hash(text: str) -> int:
@@ -241,7 +244,7 @@ def _split_entry(content: str, line: str) -> tuple[str, str]:
         key, rest = _scalar(content[:colon], line), content[colon + 1:]
     if rest and not rest.startswith(" "):
         raise ValueError(f"expected a space after ':' in {line!r}")
-    return key, rest.strip()
+    return key, rest.strip(" ")  # only spaces, as the C++ reader
 
 
 @dataclass
