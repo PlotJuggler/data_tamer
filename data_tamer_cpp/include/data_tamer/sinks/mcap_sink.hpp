@@ -9,23 +9,27 @@
 namespace DataTamer
 {
 
+namespace details
+{
+/// File name used for rollover number `number` of `path`: "_<number>" is
+/// inserted before the extension of the file name (directories are left alone).
+/// The extension is the trailing run of purely alphabetic dot-segments, so
+/// multi-part extensions survive and dotted stems stay whole:
+///   "dir.d/run.tamer.mcap" -> "dir.d/run_1.tamer.mcap"
+///   "log_2026.10.05.mcap"  -> "log_2026.10.05_1.mcap"
+///   "data.v2.mcap"         -> "data.v2_1.mcap"
+/// A name without such an extension gets the counter appended ("log" -> "log_1",
+/// "log.123" -> "log.123_1"); the leading dots of a hidden file belong to the
+/// name (".rec.mcap" -> ".rec_1.mcap", ".rec" -> ".rec_1").
+std::string NumberedPath(const std::string& path, size_t number);
+}  // namespace details
+
 /**
  * @brief The MCAPSink is a DataSink that saves the data as an MCAP file
  * (https://mcap.dev/). Create it with MCAPSink::create() and pass the returned
  * worker to LogChannel::addDataSink(); reach the methods below through
  * worker->as<MCAPSink>().
  */
-namespace details
-{
-/// File name used for rollover number `number` of `path`. The counter goes
-/// before the first dot of the file name (directories are left alone), so
-/// multi-part extensions survive: "dir.d/run.tamer.mcap" -> "dir.d/run_1.tamer.mcap".
-/// A name without a dot gets the counter appended ("log" -> "log_1"); the
-/// leading dots of a hidden file belong to the name (".rec.mcap" -> ".rec_1.mcap",
-/// ".rec" -> ".rec_1").
-std::string NumberedPath(const std::string& path, size_t number);
-}  // namespace details
-
 class MCAPSink : public DataSink
 {
 public:
@@ -35,7 +39,9 @@ public:
    * set `do_compression` to false.
    * Compression is safe if your application is closing cleanly.
    *
-   * @param filepath   path of the file to be saved. Should have extension ".mcap"
+   * @param filepath   path of the file to be saved. Should have extension ".mcap".
+   *                   An existing file at this path is overwritten; rollover files
+   *                   (see setCreateNewFileOnReset) never overwrite existing ones.
    * @param do_compression if true, compress the data on the fly.
    */
   explicit MCAPSink(std::string const& filepath, bool do_compression = false);
@@ -57,9 +63,11 @@ public:
 
   /// What happens on a reset (see `setMaxTimeBeforeReset`).
   /// If `create_new_file` is true (default), the recording continues in a new
-  /// file whose name carries a counter, inserted before the first dot of the
-  /// file name: "run.tamer.mcap" -> "run_1.tamer.mcap", "run_2.tamer.mcap", ...
-  /// (see details::NumberedPath). Nothing is lost, but disk usage is unbounded.
+  /// file whose name carries a counter, inserted before the extension:
+  /// "run.tamer.mcap" -> "run_1.tamer.mcap", "run_2.tamer.mcap", ...
+  /// (see details::NumberedPath). Numbered names that already exist, e.g. from
+  /// a previous run with the same path, are skipped, never overwritten.
+  /// Nothing is lost, but disk usage is unbounded.
   /// If false, the same file is truncated and restarted: everything recorded
   /// before the reset is DISCARDED. Use it only to bound disk usage.
   void setCreateNewFileOnReset(bool create_new_file);
@@ -88,7 +96,7 @@ private:
   struct Pimpl;
   std::unique_ptr<Pimpl> _p;
 
-  void openFile(std::string const& filepath);
+  void openFile(std::string const& filepath, bool do_compression);
   void restartRecordingImpl(std::string const& filepath, bool do_compression,
                             bool new_file);
 };
