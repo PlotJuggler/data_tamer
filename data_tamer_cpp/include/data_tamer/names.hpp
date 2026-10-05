@@ -49,7 +49,9 @@ inline void AppendNameComponents(std::string& out, std::string_view part)
  * elements; this helper always produces an accepted name, unless the result is
  * empty or a component contains a space.
  *
- * @param parts anything convertible to std::string_view (std::string, const char*, ...)
+ * @param parts anything convertible to std::string_view (std::string, const char*, ...).
+ *              Passing a null `const char*` is undefined behaviour, as for
+ *              std::string_view itself.
  */
 template <typename... Parts>
 [[nodiscard]] std::string JoinNames(const Parts&... parts)

@@ -8,7 +8,9 @@ Unreleased
   have empty ``/``-separated components (leading, trailing or repeated ``/``,
   e.g. ``"/loco//torso/x"``), which PlotJuggler showed as empty path elements.
   The same rules, and the existing no-spaces rule, now also apply to the field
-  names of a ``TypeDefinition``; a rejected type leaves the channel unchanged.
+  names of a ``TypeDefinition`` and of every custom type nested in it; a
+  rejected type leaves the channel unchanged. ``registerCustomValue()`` checks
+  only the value name: the serializer owns its schema text.
   New header-only ``DataTamer::JoinNames(parts...)`` (``data_tamer/names.hpp``,
   included by ``channel.hpp``) joins components with a single ``/`` and drops
   empty ones, so namespaces may carry trailing slashes:

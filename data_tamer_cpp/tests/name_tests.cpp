@@ -62,6 +62,44 @@ std::string_view TypeDefinition(NestedFields& obj, AddField& add)
   add("a/b", &obj.x);  // a non-empty nested path is fine
   return "NestedFields";
 }
+
+struct InnerBad
+{
+  double v = 0;
+};
+template <typename AddField>
+std::string_view TypeDefinition(InnerBad& obj, AddField& add)
+{
+  add("/v", &obj.v);
+  return "InnerBad";
+}
+
+struct OuterOk
+{
+  double a = 0;
+  std::vector<InnerBad> inner;
+};
+template <typename AddField>
+std::string_view TypeDefinition(OuterOk& obj, AddField& add)
+{
+  add("a", &obj.a);
+  add("inner", &obj.inner);
+  return "OuterOk";
+}
+
+// Recursive type: validation must terminate.
+struct TreeNode
+{
+  double value = 0;
+  std::vector<TreeNode> children;
+};
+template <typename AddField>
+std::string_view TypeDefinition(TreeNode& obj, AddField& add)
+{
+  add("value", &obj.value);
+  add("children", &obj.children);
+  return "TreeNode";
+}
 }  // namespace
 
 TEST(Names, JoinNamesCollapsesSlashes)
@@ -149,6 +187,27 @@ TEST(Names, RejectsInvalidCustomFieldNames)
   std::vector<BadFields> bad_vect(1);
   EXPECT_THROW((void)channel->registerValue("bad_vect", &bad_vect), std::runtime_error);
   EXPECT_TRUE(channel->getSchema().custom_types.empty());
+}
+
+TEST(Names, RejectsInvalidFieldNamesOfNestedTypes)
+{
+  auto channel = LogChannel::create("chan");
+  OuterOk outer;
+  for(const std::string name : { "o1", "o2" })
+  {
+    const auto msg =
+        RegistrationError([&] { (void)channel->registerValue(name, &outer); });
+    EXPECT_TRUE(Contains(msg, "custom type 'InnerBad'")) << msg;
+    EXPECT_TRUE(Contains(msg, "'/v'")) << msg;
+  }
+  // Neither the outer nor the inner type was half-registered.
+  const auto schema = channel->getSchema();
+  EXPECT_TRUE(schema.fields.empty());
+  EXPECT_TRUE(schema.custom_types.empty());
+
+  TreeNode tree;
+  EXPECT_NO_THROW((void)channel->registerValue("tree", &tree));
+  EXPECT_EQ(channel->getSchema().custom_types.count("TreeNode"), 1u);
 }
 
 TEST(Names, ErrorsNameChannelAndValue)

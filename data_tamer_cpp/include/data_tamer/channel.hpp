@@ -6,10 +6,13 @@
 #include "data_tamer/names.hpp"
 #include "data_tamer/details/shared_state.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string_view>
+#include <vector>
 
 namespace DataTamer
 {
@@ -105,8 +108,9 @@ public:
    * A name must be unique in the channel, must not be empty, must not contain
    * spaces and must not have empty '/'-separated components (no leading,
    * trailing or repeated '/'): use JoinNames() to build hierarchical names.
-   * The same rules apply to the field names in a TypeDefinition. Violations
-   * throw std::runtime_error naming the channel and the value.
+   * The same rules apply to the field names in a TypeDefinition, including
+   * nested types. Violations throw std::runtime_error naming the channel and
+   * the value, and leave the channel unchanged.
    *
    * @param name   name of the value
    * @param value  pointer to the value
@@ -158,6 +162,9 @@ public:
    * data is able to deserialize it correctly. Sink mayl save the custom schema, but
    * it may or may not be enough.
    * Prefer the template specialization of RegisterVariable<T>, if you can.
+   *
+   * The value name follows the rules of registerValue(). The field names inside
+   * the serializer's schema are not checked: the serializer owns that text.
    *
    * @param name      name of the array
    * @param value     pointer to the array of values.
@@ -372,6 +379,15 @@ private:
   template <typename T>
   void updateTypeRegistryImpl(FieldsVector& fields, const char* name);
 
+  /// The only place that invokes a user TypeDefinition.
+  template <typename T, typename AddField>
+  static void visitTypeDefinition(AddField& add_field);
+
+  /// Validates the field names of T and of every custom type nested in it that
+  /// is not in the schema yet, before anything is registered.
+  template <typename T>
+  void checkTypeFields(std::vector<std::string_view>& visiting) const;
+
   void addCustomType(const std::string& custom_type_name, const FieldsVector& fields);
 
   /// Throws std::runtime_error, naming the channel, if `name` is not a valid value name.
@@ -429,6 +445,45 @@ void LogChannel::updateTypeRegistryImpl(FieldsVector& fields, const char* field_
   fields.push_back(field);
 }
 
+template <typename T, typename AddField>
+inline void LogChannel::visitTypeDefinition(AddField& add_field)
+{
+  T dummy;
+  TypeDefinition(dummy, add_field);
+}
+
+template <typename T>
+inline void LogChannel::checkTypeFields(std::vector<std::string_view>& visiting) const
+{
+  const std::string_view type_name = CustomTypeName<T>::get();
+  // Already validated (in the schema) or being validated (recursive type).
+  if(hasCustomType(std::string(type_name)) ||
+     std::find(visiting.begin(), visiting.end(), type_name) != visiting.end())
+  {
+    return;
+  }
+  visiting.push_back(type_name);
+  auto check = [this, &visiting, type_name](const char* field_name, const auto* member) {
+    checkFieldName(type_name, field_name);
+    using MemberType =
+        typename std::remove_cv_t<std::remove_reference_t<decltype(*member)>>;
+    if constexpr(SerializeMe::container_info<MemberType>::is_container)
+    {
+      using Type = typename SerializeMe::container_info<MemberType>::value_type;
+      if constexpr(GetBasicType<Type>() == BasicType::OTHER)
+      {
+        checkTypeFields<Type>(visiting);
+      }
+    }
+    else if constexpr(GetBasicType<MemberType>() == BasicType::OTHER)
+    {
+      checkTypeFields<MemberType>(visiting);
+    }
+  };
+  visitTypeDefinition<T>(check);
+  visiting.pop_back();
+}
+
 template <typename T>
 inline void LogChannel::updateTypeRegistry()
 {
@@ -450,16 +505,10 @@ inline void LogChannel::updateTypeRegistry()
       }
       return;
     }
-    if(!hasCustomType(type_name))
-    {
-      // Validate the field names before anything is added to the registry, so
-      // a rejected type leaves the channel unchanged.
-      T dummy;
-      auto check = [this, &type_name](const char* field_name, const auto*) {
-        checkFieldName(type_name, field_name);
-      };
-      TypeDefinition(dummy, check);
-    }
+    // Validate T and all its nested types before anything is added to the
+    // registry, so a rejected type leaves the channel unchanged.
+    std::vector<std::string_view> visiting;
+    checkTypeFields<T>(visiting);
     if(auto added_serializer = _type_registry.addType<T>(type_name, true))
     {
       auto func = [this, &fields](const char* field_name, const auto* member) {
@@ -467,8 +516,7 @@ inline void LogChannel::updateTypeRegistry()
             typename std::remove_cv_t<std::remove_reference_t<decltype(*member)>>;
         updateTypeRegistryImpl<MemberType>(fields, field_name);
       };
-      T dummy;
-      TypeDefinition(dummy, func);
+      visitTypeDefinition<T>(func);
       addCustomType(type_name, fields);
     }
   }
