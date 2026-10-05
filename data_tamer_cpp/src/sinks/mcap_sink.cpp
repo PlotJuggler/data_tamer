@@ -80,7 +80,7 @@ struct MCAPSink::Pimpl
   std::chrono::seconds reset_time = std::chrono::seconds(60 * 10);
   std::chrono::system_clock::time_point start_time;
 
-  std::vector<uint8_t> message_body;  // reused, see mcap_encoding::writeMessage
+  std::vector<uint8_t> message_body;  // reused, see mcap_encoding::WriteMessage
   bool forced_stop_recording = false;
   std::recursive_mutex mutex;
 };
@@ -126,7 +126,7 @@ void MCAPSink::onSchema(Schema const& schema)
     return;
   }
 
-  _p->hash_to_channel[schema.hash].id = mcap_encoding::addChannel(*_p->writer, schema);
+  _p->hash_to_channel[schema.hash].id = mcap_encoding::AddChannel(*_p->writer, schema);
 }
 
 void MCAPSink::onSnapshot(const SnapshotRef& ref)
@@ -138,7 +138,7 @@ void MCAPSink::onSnapshot(const SnapshotRef& ref)
   }
   const Snapshot& snapshot = *ref;
   auto& channel = _p->hash_to_channel.at(snapshot.schema_hash);
-  const auto status = mcap_encoding::writeSnapshot(
+  const auto status = mcap_encoding::WriteSnapshot(
       *_p->writer, channel.id, channel.next_sequence++, snapshot, _p->message_body);
   if(!status.ok())
   {

@@ -49,9 +49,9 @@ TEST(McapEncoding, MessageBodyMatchesGoldenVectors)
     const auto expected = readVector(prefix + ".mcap_message");
     ASSERT_FALSE(expected.empty()) << prefix;
     std::vector<uint8_t> body;
-    mcap_encoding::encodeMessageBody(mask, payload, body);
+    mcap_encoding::EncodeMessageBody(mask, payload, body);
     EXPECT_EQ(body, expected) << prefix;
-    EXPECT_EQ(body.size(), mcap_encoding::messageBodySize(mask.size(), payload.size()));
+    EXPECT_EQ(body.size(), mcap_encoding::MessageBodySize(mask.size(), payload.size()));
   }
 }
 
@@ -60,12 +60,12 @@ TEST(McapEncoding, EncodingIntoReusedBufferDoesNotAllocate)
   const std::vector<uint8_t> mask = { 0xFF, 0x01 };
   const std::vector<uint8_t> payload(100, 0xAB);
   std::vector<uint8_t> body;
-  body.reserve(mcap_encoding::messageBodySize(mask.size(), payload.size()));
+  body.reserve(mcap_encoding::MessageBodySize(mask.size(), payload.size()));
   DataTamerTest::AllocCounter::Scope scope;
-  mcap_encoding::encodeMessageBody(mask, payload, body);
-  mcap_encoding::encodeMessageBody({ mask.data(), 1 }, { payload.data(), 10 }, body);
+  mcap_encoding::EncodeMessageBody(mask, payload, body);
+  mcap_encoding::EncodeMessageBody({ mask.data(), 1 }, { payload.data(), 10 }, body);
   EXPECT_EQ(scope.allocations(), 0u);
-  EXPECT_EQ(body.size(), mcap_encoding::messageBodySize(1, 10));
+  EXPECT_EQ(body.size(), mcap_encoding::MessageBodySize(1, 10));
 }
 
 // Snapshots stored by the application (not pool slots) are written later with
@@ -98,19 +98,19 @@ TEST(McapEncoding, StoredSnapshotsRoundTrip)
     mcap::McapWriter writer;
     ASSERT_TRUE(
         writer.open(path, mcap::McapWriterOptions(mcap_encoding::kEncoding)).ok());
-    const auto channel_id = mcap_encoding::addChannel(writer, schema);
+    const auto channel_id = mcap_encoding::AddChannel(writer, schema);
     std::vector<uint8_t> scratch;
     uint32_t sequence = 1;
     // Snapshot overload for the first two, span overload for the last one.
     ASSERT_TRUE(
-        mcap_encoding::writeSnapshot(writer, channel_id, sequence++, stored[0], scratch)
+        mcap_encoding::WriteSnapshot(writer, channel_id, sequence++, stored[0], scratch)
             .ok());
     ASSERT_TRUE(
-        mcap_encoding::writeSnapshot(writer, channel_id, sequence++, stored[1], scratch)
+        mcap_encoding::WriteSnapshot(writer, channel_id, sequence++, stored[1], scratch)
             .ok());
     const auto& last = stored[2];
     ASSERT_TRUE(
-        mcap_encoding::writeMessage(writer, channel_id, sequence++, last.timestamp,
+        mcap_encoding::WriteMessage(writer, channel_id, sequence++, last.timestamp,
                                     { last.active_mask.data(), last.active_mask.size() },
                                     { last.payload.data(), last.payload.size() }, scratch)
             .ok());
