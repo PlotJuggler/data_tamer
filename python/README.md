@@ -1,8 +1,9 @@
 # data-tamer-parser
 
-Reference decoder for the [Data Tamer](https://github.com/PickNikRobotics/data_tamer)
+Reference decoder for the [Data Tamer](https://github.com/PlotJuggler/data_tamer)
 wire format, specified in
-[docs/wire_format.md](https://github.com/PickNikRobotics/data_tamer/blob/main/docs/wire_format.md).
+[docs/wire_format.md](https://github.com/PlotJuggler/data_tamer/blob/V2/docs/wire_format.md)
+(the V2 branch, until it is merged).
 A single module, `data_tamer_parser`, using the Python standard library only.
 
 ```
@@ -21,6 +22,8 @@ for timestamp_nsec, topic, values in dt.iter_mcap("log.mcap"):
 ```
 
 Disabled fields are absent from `values`. Channels with another encoding are skipped.
+`iter_mcap()` reads one file: `MCAPSink` can split a recording into numbered files
+(`run.mcap`, `run_1.mcap`, ...), each self-contained, so read them in turn.
 
 ## Field names from a schema
 
@@ -35,7 +38,19 @@ schema.field_names()   # ["pose/position/x", "arr[0]", "arr[1]", "vec[]", "point
 Nested fields join with `/` and fixed arrays (`T[N]`) are expanded to `[0]`..`[N-1]`.
 A dynamic vector (`T[]`) has a length known only per message, so its elements are
 listed once with empty brackets (`vec[]`, `points[]/x`), where the decoder produces
-`vec[0]`, `vec[1]`, ...
+`vec[0]`, `vec[1]`, ... The `[]` is a placeholder: a field whose own name ends in `[]`
+would look the same. A field of an opaque custom type is listed under its own name, but
+`parse_snapshot()` cannot decode a snapshot where it is enabled. `ValueError` is raised
+for undefined or cyclic types, nesting deeper than the decoder accepts
+(`MAX_SCHEMA_DEPTH`) and schemas that expand to more than `MAX_FIELD_NAMES`
+(1,000,000) names.
+
+## Versions and releases
+
+The package is released together with the C++ library: a release tag, the
+`package.xml` versions and `data_tamer_parser.__version__` are the same `X.Y.Z`. The
+`python` workflow publishes to PyPI only for tags of that form, and fails if the tag
+differs from `__version__`.
 
 ## Lower level
 

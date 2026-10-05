@@ -34,9 +34,12 @@ Unreleased
 * The Python decoder is a package, ``data-tamer-parser`` (``python/pyproject.toml``,
   still standard library only, importable as ``data_tamer_parser``; version
   ``data_tamer_parser.__version__``): ``pip install ./python``. The ``python``
-  workflow tests and builds it and publishes it to PyPI on tags. New
+  workflow tests and builds it and publishes it to PyPI on ``X.Y.Z`` tags; it
+  is versioned in lockstep with the library (release tag == ``package.xml``
+  version == ``data_tamer_parser.__version__``). New
   ``Schema.field_names()`` lists the flattened names from the schema alone
-  (dynamic vector elements as ``vec[]``), and ``iter_mcap(path)`` yields
+  (dynamic vector elements as the placeholder ``vec[]``; bounded by
+  ``MAX_SCHEMA_DEPTH`` and ``MAX_FIELD_NAMES``), and ``iter_mcap(path)`` yields
   ``(timestamp, topic, values)`` for an MCAP file, with the optional ``mcap``
   package (``data-tamer-parser[mcap]``).
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):

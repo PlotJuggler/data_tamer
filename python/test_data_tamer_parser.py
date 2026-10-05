@@ -95,6 +95,38 @@ class FieldNames(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 dt.parse_schema(text).field_names()
 
+    @staticmethod
+    def chain(depth: int, leaf: str = "float32 x") -> str:
+        """Top field of type T1, T1 holds a T2, ..., T<depth> holds `leaf`."""
+        types = "".join(f"=====\nMSG: T{i}\nT{i + 1} t\n" for i in range(1, depth))
+        return (f"### version: 5\n### hash: 0\n### channel_name: c\n\nT1 t\n{types}"
+                f"=====\nMSG: T{depth}\n{leaf}\n")
+
+    def test_depth_limit_matches_the_decoder(self):
+        ok = dt.parse_schema(self.chain(dt.MAX_SCHEMA_DEPTH))
+        self.assertEqual(ok.field_names(), ["t/" * dt.MAX_SCHEMA_DEPTH + "x"])
+        self.assertEqual(dt.parse_snapshot(ok, b"\x01", b"\0" * 4), {"t/" * 64 + "x": 0.0})
+        for depth in (dt.MAX_SCHEMA_DEPTH + 1, 80, 1200):  # 1200: no RecursionError
+            schema = dt.parse_schema(self.chain(depth))
+            with self.subTest(depth=depth), self.assertRaises(ValueError):
+                schema.field_names()
+            with self.subTest(depth=depth), self.assertRaises(ValueError):
+                dt.parse_snapshot(schema, b"\x01", b"\0" * 4)
+        # a deep type reached again, deeper, through the memo
+        text = ("### version: 5\n### hash: 0\n### channel_name: c\n\nT1 a\nW w\n"
+                "=====\nMSG: W\nT1 b\n" + self.chain(dt.MAX_SCHEMA_DEPTH).split("T1 t\n", 1)[1])
+        with self.assertRaises(ValueError):
+            dt.parse_schema(text).field_names()
+
+    def test_size_limit(self):
+        text = ("### version: 5\n### hash: 0\n### channel_name: c\n\nA[65535] a\n"
+                "=====\nMSG: A\nB[65535] b\n=====\nMSG: B\nfloat32[65535] x\n")
+        with self.assertRaisesRegex(ValueError, "more than"):
+            dt.parse_schema(text).field_names()  # 65535**3 names: refused, not listed
+        wide = ("### version: 5\n### hash: 0\n### channel_name: c\n\nA[1000] a\n"
+                "=====\nMSG: A\nfloat32[1000] x\n")
+        self.assertEqual(len(dt.parse_schema(wide).field_names()), dt.MAX_FIELD_NAMES)
+
 
 class YamlSchema(unittest.TestCase):
     """The YAML rendering (version 6) decodes to the same schema as the line format."""
@@ -221,17 +253,19 @@ class RosMessageHelpers(unittest.TestCase):
 
 def write_mcap(stream, channels):
     """An MCAP file as MCAPSink writes it (spec section 4.1): channels are
-    (topic, schema text, [(timestamp, message body)]), plus a non Data Tamer channel."""
+    (topic, schema text, [(timestamp, message body)][, schema encoding]), plus a
+    non Data Tamer channel."""
     from mcap.writer import Writer
     writer = Writer(stream)
     writer.start(profile="data_tamer", library="test")
     other_schema = writer.register_schema(name="Other", encoding="jsonschema", data=b"{}")
     other = writer.register_channel(topic="other", message_encoding="json", schema_id=other_schema)
     writer.add_message(other, log_time=5, publish_time=5, data=b"{}", sequence=1)
-    for topic, text, messages in channels:
+    for topic, text, messages, *encoding in channels:
         schema = dt.parse_schema(text)
         schema_id = writer.register_schema(name=f"{schema.channel_name}::{schema.hash}",
-                                           encoding="data_tamer", data=text.encode())
+                                           encoding=(encoding or ["data_tamer"])[0],
+                                           data=text.encode())
         channel_id = writer.register_channel(topic=topic, message_encoding="data_tamer",
                                              schema_id=schema_id)
         for timestamp, body in messages:
@@ -254,6 +288,7 @@ class Mcap(unittest.TestCase):
         write_mcap(self.stream, [
             ("wire_test", read("schema.txt").decode(), [(30, full), (10, masked)]),
             ("as_yaml", read("schema.yaml").decode(), [(20, full)]),
+            ("wrong_schema_encoding", read("schema.txt").decode(), [(15, full)], "ros2msg"),
         ])
 
     def test_iter_mcap(self):
@@ -271,6 +306,18 @@ class Mcap(unittest.TestCase):
             path.write_bytes(self.stream.getvalue())
             self.assertEqual(len(list(dt.iter_mcap(path))), 3)
             self.assertEqual([t for t, _, _ in dt.iter_mcap(str(path), topics=["as_yaml"])], [20])
+
+    def test_verify_hash_rejects_wrong_hash(self):
+        text = read("schema.txt").decode()
+        declared = dt.parse_schema(text).hash
+        stream = io.BytesIO()
+        write_mcap(stream, [("tampered", text.replace(f"hash: {declared}", f"hash: {declared + 1}"),
+                             [(1, read("snapshot_full.mcap_message"))])])
+        stream.seek(0)
+        self.assertEqual(len(list(dt.iter_mcap(stream))), 1)  # not checked by default
+        stream.seek(0)
+        with self.assertRaises(ValueError):
+            list(dt.iter_mcap(stream, verify_hash=True))
 
 
 if __name__ == "__main__":

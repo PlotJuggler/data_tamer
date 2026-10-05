@@ -1,15 +1,20 @@
 name: python
 
 # Tests the Python decoder (python/), builds its sdist and wheel, and publishes
-# them to PyPI as data-tamer-parser when a tag is pushed. Publishing uses PyPI
-# trusted publishing: the project must list this repository, this workflow
-# (python.yml) and the environment "pypi" as a trusted publisher on pypi.org.
+# them to PyPI as data-tamer-parser when a release tag X.Y.Z is pushed. The
+# package is versioned with the library: release tag == package.xml version ==
+# data_tamer_parser.__version__ (checked below). Publishing uses PyPI trusted
+# publishing: the project must list this repository, this workflow (python.yml)
+# and the environment "pypi" as a trusted publisher on pypi.org.
 
 on:
   push:
-    tags: ['*']
-    branches: ['**']
+    branches: [main, V2]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -47,6 +52,7 @@ jobs:
     - name: Check that the tag matches the package version
       if: startsWith(github.ref, 'refs/tags/')
       run: |
+        [[ "${GITHUB_REF_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag"; exit 1; }
         version=$(python -c "import sys; sys.path.insert(0, 'python'); import data_tamer_parser; print(data_tamer_parser.__version__)")
         test "$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != data_tamer_parser.__version__ $version"; exit 1; }
     - uses: actions/upload-artifact@v4
@@ -55,7 +61,7 @@ jobs:
         path: dist/
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [test, build]
     runs-on: ubuntu-latest
     environment: pypi

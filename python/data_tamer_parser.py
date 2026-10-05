@@ -77,9 +77,19 @@ class Schema:
         Names are built as in the decoder: "pose/position/x", "arr[3]". The
         length of a dynamic vector ("T[]") is only known per message, so its
         elements are listed once with empty brackets: "vec[]", "points[]/x"
-        (the decoder emits "vec[0]", "points[1]/x", ...). A field of an opaque
-        custom type is listed under its own name, which the decoder cannot expand.
+        (the decoder emits "vec[0]", "points[1]/x", ...). "[]" is a placeholder:
+        a field whose own name ends in "[]" would be listed the same way. A field of an opaque
+        custom type is listed under its own name; its content is not described
+        by the schema, and parse_snapshot() raises ValueError when it is enabled.
+
+        Raises ValueError for an undefined or cyclic custom type, for nesting
+        deeper than parse_snapshot() accepts (MAX_SCHEMA_DEPTH), and when the
+        schema would expand to more than MAX_FIELD_NAMES names.
         """
+        counts: dict[str, tuple[int, int]] = {}
+        total = sum(_names_count(f, self, counts, 0) for f in self.fields)
+        if total > MAX_FIELD_NAMES:
+            raise ValueError(f"schema expands to {total} names, more than {MAX_FIELD_NAMES}")
         out: list[str] = []
         for f in self.fields:
             _field_names(f, self, "", out)
@@ -411,15 +421,41 @@ def _parse_field(f: Field, schema: Schema, reader: _Reader, prefix: str, out: di
         raise ValueError(f"type {f.type_name!r} has an opaque encoding; cannot continue")
 
 
-def _field_names(f: Field, schema: Schema, prefix: str, out: list[str],
-                 enclosing: tuple[str, ...] = ()) -> None:
-    """The names _parse_field() would produce for `f`; "[]" for a dynamic vector element.
+MAX_FIELD_NAMES = 1_000_000  # Schema.field_names() refuses to list more names
 
-    `enclosing` are the custom types being expanded: a type found among them is
-    a cycle, reported before fixed arrays could multiply the work.
+
+def _names_count(f: Field, schema: Schema, memo: dict, depth: int) -> int:
+    """How many names `f` expands to, checking its types like _parse_field() does.
+
+    memo maps a custom type to (names per element, nesting height), or to None
+    while that type is being expanded (finding it then means a cycle). Work is
+    linear in the number of type references, whatever the array sizes.
     """
-    if f.type_name in enclosing:
-        raise ValueError(f"custom type {f.type_name!r} contains itself (cyclic schema)")
+    if depth > MAX_SCHEMA_DEPTH:
+        raise ValueError("custom types nested too deeply (cyclic schema?)")
+    per_element, height = 1, 0  # basic or opaque type: one name, no nesting
+    if not f.is_basic and f.type_name not in schema.custom_schemas:
+        if f.type_name not in schema.custom_types:
+            raise ValueError(f"type {f.type_name!r} is not defined in the schema")
+        if f.type_name in memo:
+            if memo[f.type_name] is None:
+                raise ValueError(f"custom type {f.type_name!r} contains itself (cyclic schema)")
+            per_element, height = memo[f.type_name]
+            if depth + height > MAX_SCHEMA_DEPTH:
+                raise ValueError("custom types nested too deeply")
+        else:
+            memo[f.type_name] = None
+            subs = schema.custom_types[f.type_name]
+            per_element = sum(_names_count(sub, schema, memo, depth + 1) for sub in subs)
+            height = 1 + max((memo[sub.type_name][1] for sub in subs
+                              if memo.get(sub.type_name)), default=0) if subs else 0
+            memo[f.type_name] = (per_element, height)
+    return per_element * (f.array_size or 1)
+
+
+def _field_names(f: Field, schema: Schema, prefix: str, out: list[str]) -> None:
+    """The names _parse_field() would produce for `f`; "[]" for a dynamic vector
+    element. The schema was checked by _names_count() first."""
     name = f.field_name if not prefix else f"{prefix}/{f.field_name}"
     if not f.is_vector:
         names = [name]
@@ -427,17 +463,15 @@ def _field_names(f: Field, schema: Schema, prefix: str, out: list[str],
         names = [f"{name}[{i}]" for i in range(f.array_size)]
     else:
         names = [f"{name}[]"]
-    subs = None
-    if not f.is_basic and f.type_name not in schema.custom_schemas:
-        if f.type_name not in schema.custom_types:
-            raise ValueError(f"type {f.type_name!r} is not defined in the schema")
-        subs = schema.custom_types[f.type_name]
+    subs = schema.custom_types.get(f.type_name) if not f.is_basic else None
+    if f.type_name in schema.custom_schemas:
+        subs = None
     for n in names:
         if subs is None:  # basic type, or opaque: not expandable from the schema
             out.append(n)
         else:
             for sub in subs:
-                _field_names(sub, schema, n, out, enclosing + (f.type_name,))
+                _field_names(sub, schema, n, out)
 
 
 def parse_snapshot(schema: Schema, active_mask: bytes, payload: bytes) -> dict[str, object]:
@@ -522,6 +556,10 @@ def iter_mcap(source, topics=None, verify_hash: bool = False):
     restricts the channels read. Messages come in log time order (the snapshot
     timestamps); channels with another encoding are skipped. Needs the `mcap`
     package (pip install "data-tamer-parser[mcap]"), imported by this call.
+
+    One call reads one file. MCAPSink can split a recording into numbered
+    files (run.mcap, run_1.mcap, ...); each is self-contained, so read them
+    one after the other.
     """
     try:
         from mcap.reader import make_reader
