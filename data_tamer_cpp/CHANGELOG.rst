@@ -26,6 +26,9 @@ Unreleased
   both renderings without dependencies, and verify a YAML schema's hash via
   ``ToText()`` / ``to_text()``. The parser's ``Schema`` gains
   ``custom_schemas`` (opaque types, filled from YAML).
+* Examples: ``ros2_publisher`` takes ``--aggregate`` and ``--yaml``;
+  ``python/ros2_subscriber.py`` decodes ``Snapshot`` and ``SnapshotBatch``
+  topics with the Python decoder.
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /

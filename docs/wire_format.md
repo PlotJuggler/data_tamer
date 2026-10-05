@@ -1,4 +1,4 @@
-# Data Tamer wire format (schema version 5)
+# Data Tamer wire format (schema versions 5 and 6)
 
 This document is the normative description of the bytes Data Tamer produces.
 Anyone can implement a decoder in any language from it without reading the C++
@@ -6,7 +6,9 @@ sources. Two artifacts keep it honest:
 
 - `docs/wire_format/vectors/` holds golden fixtures: a schema text, two
   snapshots (all fields enabled, two fields disabled), their MCAP message bodies
-  and the decoded values (`expected.json`).
+  and the decoded values (`expected.json`), plus the YAML rendering of that
+  schema (`schema.yaml`) and a schema with path-like names in both renderings
+  (`schema_nested.txt`, `schema_nested.yaml`).
 - `data_tamer_cpp/tests/wire_format_tests.cpp` regenerates those bytes from the
   library and fails if they differ. `python/data_tamer_parser.py` is a
   standard-library-only reference decoder and `python/test_data_tamer_parser.py`
