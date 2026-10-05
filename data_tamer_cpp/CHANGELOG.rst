@@ -4,6 +4,15 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* ``ROS2PublisherSink`` can aggregate snapshots: pass ``ROS2PublisherOptions``
+  with ``aggregate = true`` to publish ``data_tamer_msgs/SnapshotBatch`` on
+  ``<prefix>/data_batch`` instead of one ``Snapshot`` per sample on
+  ``<prefix>/data``. A batch is sent when it reaches ``max_batch_size``
+  snapshots, when a snapshot arrives ``max_batch_delay`` after the first one of
+  the batch, on ``flush()`` and when the sink is destroyed. ``embed_schemas``
+  (default on) puts the schemas of the batch's snapshots in the message, so it
+  decodes without the ``schemas`` topic. Schema texts are now serialized once,
+  in ``onSchema()``, instead of on every republish.
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /

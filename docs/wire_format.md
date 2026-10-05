@@ -207,13 +207,19 @@ A file from a process that was killed has no footer; recover it with
 
 ### 4.2 ROS 2 (`ROS2PublisherSink`)
 
-Two topics under a user-chosen prefix:
+Topics under a user-chosen prefix:
 
 - `<prefix>/schemas`, type `data_tamer_msgs/msg/Schemas`, reliable and
   transient-local, republished whenever a schema is added. Each entry carries
   `uint64 hash`, `string channel_name`, `string schema_text` (section 2).
 - `<prefix>/data`, type `data_tamer_msgs/msg/Snapshot`: `uint64 timestamp_nsec`,
   `uint64 schema_hash`, `uint8[] active_mask`, `uint8[] payload`.
+- `<prefix>/data_batch`, type `data_tamer_msgs/msg/SnapshotBatch`, instead of
+  `<prefix>/data` when `ROS2PublisherOptions::aggregate` is set:
+  `Schema[] schemas`, `Snapshot[] snapshots`. Snapshots are in the order they
+  were taken. When `embed_schemas` is set (the default), `schemas` holds the
+  schema of every snapshot in the batch, each once, so a batch decodes on its
+  own; otherwise it is empty and the `schemas` topic is needed.
 
 ## 5. Schema hash
 

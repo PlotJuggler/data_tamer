@@ -1,7 +1,10 @@
 #include "data_tamer/sinks/ros2_publisher_sink.hpp"
 #include "data_tamer_msgs/msg/schemas.hpp"
 #include "data_tamer_msgs/msg/snapshot.hpp"
+#include "data_tamer_msgs/msg/snapshot_batch.hpp"
 
+#include <algorithm>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -11,29 +14,58 @@ namespace DataTamer
 
 struct ROS2PublisherSink::Pimpl
 {
-  explicit Pimpl(PublisherNodeInterfaces node_interface)
-    : node_interface(std::move(node_interface))
-  {}
+  Pimpl(PublisherNodeInterfaces interfaces, const ROS2PublisherOptions& opts)
+    : options(opts), node_interface(std::move(interfaces))
+  {
+    options.max_batch_size = std::max<size_t>(1, opts.max_batch_size);
+  }
 
-  // onSchema/onSnapshot are serialized by the SinkWorker: no lock needed.
-  std::unordered_map<uint64_t, Schema> schemas;
+  // onSchema/onSnapshot are serialized by the SinkWorker, but flush() may be
+  // called from any thread.
+  std::mutex mutex;
+
+  ROS2PublisherOptions options;
+
+  // Schemas in message form: the text is serialized once, in onSchema().
+  std::unordered_map<uint64_t, data_tamer_msgs::msg::Schema> schemas;
 
   rclcpp::Publisher<data_tamer_msgs::msg::Schemas>::SharedPtr schema_publisher;
   rclcpp::Publisher<data_tamer_msgs::msg::Snapshot>::SharedPtr data_publisher;
+  rclcpp::Publisher<data_tamer_msgs::msg::SnapshotBatch>::SharedPtr batch_publisher;
 
   bool schema_changed = true;
   data_tamer_msgs::msg::Snapshot data_msg;
+
+  data_tamer_msgs::msg::SnapshotBatch batch_msg;
+  std::chrono::steady_clock::time_point batch_start;
+
   PublisherNodeInterfaces node_interface;
+
+  void publishSchemasIfChanged();
+  void addToBatch(const Snapshot& snapshot);
+  void publishBatch();
 };
 
 ROS2PublisherSink::ROS2PublisherSink(PublisherNodeInterfaces node_interface,
-                                     const std::string& topic_prefix, ConstructorTag)
-  : _p(std::make_unique<Pimpl>(std::move(node_interface)))
+                                     const std::string& topic_prefix,
+                                     const ROS2PublisherOptions& options, ConstructorTag)
+  : _p(std::make_unique<Pimpl>(std::move(node_interface), options))
 {
   create_publishers(topic_prefix);
 }
 
-ROS2PublisherSink::~ROS2PublisherSink() = default;
+ROS2PublisherSink::~ROS2PublisherSink()
+{
+  // The SinkWorker is stopped before the sink is destroyed: no concurrent callback.
+  try
+  {
+    flush();
+  }
+  catch(...)
+  {
+    // e.g. the ROS context was already shut down; nothing left to report to.
+  }
+}
 
 void ROS2PublisherSink::create_publishers(const std::string& topic_prefix)
 {
@@ -45,45 +77,129 @@ void ROS2PublisherSink::create_publishers(const std::string& topic_prefix)
 
   _p->schema_publisher = rclcpp::create_publisher<data_tamer_msgs::msg::Schemas>(
       _p->node_interface, topic_prefix + "/schemas", schemas_qos);
-  _p->data_publisher = rclcpp::create_publisher<data_tamer_msgs::msg::Snapshot>(
-      _p->node_interface, topic_prefix + "/data", data_qos);
+  if(_p->options.aggregate)
+  {
+    _p->batch_publisher = rclcpp::create_publisher<data_tamer_msgs::msg::SnapshotBatch>(
+        _p->node_interface, topic_prefix + "/data_batch", data_qos);
+    _p->batch_msg.snapshots.reserve(_p->options.max_batch_size);
+  }
+  else
+  {
+    _p->data_publisher = rclcpp::create_publisher<data_tamer_msgs::msg::Snapshot>(
+        _p->node_interface, topic_prefix + "/data", data_qos);
+  }
 }
 
 void ROS2PublisherSink::onSchema(const Schema& schema)
 {
-  _p->schemas[schema.hash] = schema;
+  data_tamer_msgs::msg::Schema schema_msg;
+  schema_msg.hash = schema.hash;
+  schema_msg.channel_name = schema.channel_name;
+  std::ostringstream ss;
+  ss << schema;
+  schema_msg.schema_text = ss.str();
+
+  std::lock_guard lock(_p->mutex);
+  _p->schemas[schema.hash] = std::move(schema_msg);
   _p->schema_changed = true;
 }
 
 void ROS2PublisherSink::onSnapshot(const SnapshotRef& ref)
 {
-  // send the schemas, if you haven't yet.
-  if(_p->schema_changed)
-  {
-    data_tamer_msgs::msg::Schemas msg;
-    msg.schemas.reserve(_p->schemas.size());
+  std::lock_guard lock(_p->mutex);
+  _p->publishSchemasIfChanged();
 
-    for(const auto& [hash, schema] : _p->schemas)
-    {
-      data_tamer_msgs::msg::Schema schema_msg;
-      schema_msg.hash = hash;
-      schema_msg.channel_name = schema.channel_name;
-      std::ostringstream ss;
-      ss << schema;
-      schema_msg.schema_text = ss.str();
-
-      msg.schemas.push_back(std::move(schema_msg));
-    }
-    _p->schema_publisher->publish(msg);
-    _p->schema_changed = false;  // only once published; a throw leaves it pending
-  }
-  //----------------------------------------
   const Snapshot& snapshot = *ref;
+  if(_p->options.aggregate)
+  {
+    _p->addToBatch(snapshot);
+    return;
+  }
   _p->data_msg.timestamp_nsec = uint64_t(snapshot.timestamp.count());
   _p->data_msg.schema_hash = snapshot.schema_hash;
   _p->data_msg.active_mask = snapshot.active_mask;
   _p->data_msg.payload = snapshot.payload;
   _p->data_publisher->publish(_p->data_msg);
+}
+
+void ROS2PublisherSink::flush()
+{
+  std::lock_guard lock(_p->mutex);
+  if(_p->options.aggregate && !_p->batch_msg.snapshots.empty())
+  {
+    _p->publishSchemasIfChanged();
+    _p->publishBatch();
+  }
+}
+
+void ROS2PublisherSink::Pimpl::publishSchemasIfChanged()
+{
+  if(!schema_changed)
+  {
+    return;
+  }
+  data_tamer_msgs::msg::Schemas msg;
+  msg.schemas.reserve(schemas.size());
+  for(const auto& entry : schemas)
+  {
+    msg.schemas.push_back(entry.second);
+  }
+  schema_publisher->publish(msg);
+  schema_changed = false;  // only once published; a throw leaves it pending
+}
+
+void ROS2PublisherSink::Pimpl::addToBatch(const Snapshot& snapshot)
+{
+  const auto now = std::chrono::steady_clock::now();
+  if(batch_msg.snapshots.empty())
+  {
+    batch_start = now;
+  }
+
+  auto& snapshot_msg = batch_msg.snapshots.emplace_back();
+  snapshot_msg.timestamp_nsec = uint64_t(snapshot.timestamp.count());
+  snapshot_msg.schema_hash = snapshot.schema_hash;
+  snapshot_msg.active_mask = snapshot.active_mask;
+  snapshot_msg.payload = snapshot.payload;
+
+  if(options.embed_schemas)
+  {
+    auto& embedded = batch_msg.schemas;
+    const bool present =
+        std::any_of(embedded.begin(), embedded.end(),
+                    [&](const auto& s) { return s.hash == snapshot.schema_hash; });
+    if(!present)
+    {
+      if(auto it = schemas.find(snapshot.schema_hash); it != schemas.end())
+      {
+        embedded.push_back(it->second);
+      }
+    }
+  }
+
+  const bool full = batch_msg.snapshots.size() >= options.max_batch_size;
+  const bool expired = options.max_batch_delay.count() > 0 &&
+                       (now - batch_start) >= options.max_batch_delay;
+  if(full || expired)
+  {
+    publishBatch();
+  }
+}
+
+void ROS2PublisherSink::Pimpl::publishBatch()
+{
+  // Reset the batch even if publish() throws, so that a failing publisher
+  // drops one batch instead of growing it without bound.
+  struct Clear
+  {
+    data_tamer_msgs::msg::SnapshotBatch& msg;
+    ~Clear()
+    {
+      msg.snapshots.clear();
+      msg.schemas.clear();
+    }
+  } clear{ batch_msg };
+  batch_publisher->publish(batch_msg);
 }
 
 }  // namespace DataTamer
