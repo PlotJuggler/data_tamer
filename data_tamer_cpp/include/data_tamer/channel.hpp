@@ -3,6 +3,7 @@
 #include "data_tamer/values.hpp"
 #include "data_tamer/data_sink.hpp"
 #include "data_tamer/logged_value.hpp"
+#include "data_tamer/names.hpp"
 #include "data_tamer/details/shared_state.hpp"
 
 #include <chrono>
@@ -100,6 +101,12 @@ public:
    * If you want to change the pointer T* to a new one,
    * you must first call unregister(), otherwise this method will throw
    * an exception.
+   *
+   * A name must be unique in the channel, must not be empty, must not contain
+   * spaces and must not have empty '/'-separated components (no leading,
+   * trailing or repeated '/'): use JoinNames() to build hierarchical names.
+   * The same rules apply to the field names in a TypeDefinition. Violations
+   * throw std::runtime_error naming the channel and the value.
    *
    * @param name   name of the value
    * @param value  pointer to the value
@@ -367,6 +374,11 @@ private:
 
   void addCustomType(const std::string& custom_type_name, const FieldsVector& fields);
 
+  /// Throws std::runtime_error, naming the channel, if `name` is not a valid value name.
+  void checkValueName(const std::string& name) const;
+  /// Same rules for a field name of a custom type's TypeDefinition.
+  void checkFieldName(std::string_view type_name, std::string_view field_name) const;
+
   [[nodiscard]] RegistrationID registerValueImpl(const std::string& name,
                                                  ValuePtr&& value_ptr,
                                                  CustomSerializer::Ptr type_info);
@@ -432,9 +444,21 @@ inline void LogChannel::updateTypeRegistry()
     {
       if(!hasCustomType(type_name))
       {
-        throw std::runtime_error("Can't add a custom type after recording started");
+        throw std::runtime_error("channel '" + channelName() +
+                                 "': can't add custom type '" + type_name +
+                                 "' after recording started");
       }
       return;
+    }
+    if(!hasCustomType(type_name))
+    {
+      // Validate the field names before anything is added to the registry, so
+      // a rejected type leaves the channel unchanged.
+      T dummy;
+      auto check = [this, &type_name](const char* field_name, const auto*) {
+        checkFieldName(type_name, field_name);
+      };
+      TypeDefinition(dummy, check);
     }
     if(auto added_serializer = _type_registry.addType<T>(type_name, true))
     {
@@ -455,6 +479,7 @@ inline RegistrationID LogChannel::registerValue(const std::string& name,
                                                 const T* value_ptr)
 {
   std::lock_guard const lock(controlMutex());
+  checkValueName(name);
   using namespace SerializeMe;
   static_assert(has_TypeDefinition<T>() || IsNumericType<T>(), "Missing TypeDefinition");
 
@@ -475,6 +500,7 @@ inline RegistrationID LogChannel::registerValue(const std::string& name,
                                                 const std::atomic<T>* value_ptr)
 {
   std::lock_guard const lock(controlMutex());
+  checkValueName(name);
   return registerValueImpl(name, ValuePtr(value_ptr), {});
 }
 
@@ -484,6 +510,7 @@ inline RegistrationID LogChannel::registerCustomValue(const std::string& name,
                                                       CustomSerializer::Ptr serializer)
 {
   std::lock_guard const lock(controlMutex());
+  checkValueName(name);
   static_assert(!IsNumericType<T>(), "This method should be used only for custom types");
   if(!serializer)
   {
@@ -498,6 +525,7 @@ inline RegistrationID LogChannel::registerValue(const std::string& prefix,
                                                 const Container<T, TArgs...>* vect)
 {
   std::lock_guard const lock(controlMutex());
+  checkValueName(prefix);
   if constexpr(IsNumericType<T>())
   {
     return registerValueImpl(prefix, ValuePtr(vect), {});
@@ -516,6 +544,7 @@ inline RegistrationID LogChannel::registerValue(const std::string& prefix,
                                                 const std::array<T, N>* vect)
 {
   std::lock_guard const lock(controlMutex());
+  checkValueName(prefix);
   if constexpr(IsNumericType<T>())
   {
     return registerValueImpl(prefix, ValuePtr(vect), {});

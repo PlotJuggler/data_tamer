@@ -109,7 +109,9 @@ Grammar, in the order lines appear:
    colon, trimmed. May contain spaces.
 4. Zero or more **field lines**: `<type-spec> <name>`. Exactly one space
    separates the two; the name is everything after it (trimmed). A name never
-   contains a space. `type-spec` is a basic type name or a custom type name,
+   contains a space. Names written by this version are also never empty and
+   have no empty `/`-separated component (no leading, trailing or repeated
+   `/`); decoders should not rely on that for older files. `type-spec` is a basic type name or a custom type name,
    optionally followed by `[]` (dynamic vector) or `[N]` (fixed array, decimal
    N, 1 to 65535). Top-level field order is the mask bit order and the payload
    order.
