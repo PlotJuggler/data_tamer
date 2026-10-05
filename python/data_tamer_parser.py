@@ -19,8 +19,16 @@ import:
     registry.add_schemas(schemas_msg)            # optional if the batch embeds them
     for schema, timestamp_nsec, values in iter_snapshot_batch(registry, batch_msg):
         ...
+
+Schema.field_names() lists the flattened names from the schema alone, and
+iter_mcap(path) reads a whole MCAP file (needs the optional `mcap` package):
+
+    for timestamp_nsec, topic, values in iter_mcap("log.mcap"):
+        ...
 """
 from __future__ import annotations
+
+__version__ = "2.0.0"
 
 import struct
 from dataclasses import dataclass, field
@@ -61,6 +69,21 @@ class Schema:
     custom_types: dict[str, list[Field]] = field(default_factory=dict)
     # opaque custom encodings: type name -> (encoding, schema text)
     custom_schemas: dict[str, tuple[str, str]] = field(default_factory=dict)
+
+    def field_names(self) -> list[str]:
+        """The flattened names parse_snapshot() can produce, in payload order,
+        computed from the schema alone (no message, so disabled fields are listed too).
+
+        Names are built as in the decoder: "pose/position/x", "arr[3]". The
+        length of a dynamic vector ("T[]") is only known per message, so its
+        elements are listed once with empty brackets: "vec[]", "points[]/x"
+        (the decoder emits "vec[0]", "points[1]/x", ...). A field of an opaque
+        custom type is listed under its own name, which the decoder cannot expand.
+        """
+        out: list[str] = []
+        for f in self.fields:
+            _field_names(f, self, "", out)
+        return out
 
 
 def _parse_type_spec(spec: str, name: str) -> Field:
@@ -383,6 +406,35 @@ def _parse_field(f: Field, schema: Schema, reader: _Reader, prefix: str, out: di
         raise ValueError(f"type {f.type_name!r} has an opaque encoding; cannot continue")
 
 
+def _field_names(f: Field, schema: Schema, prefix: str, out: list[str],
+                 enclosing: tuple[str, ...] = ()) -> None:
+    """The names _parse_field() would produce for `f`; "[]" for a dynamic vector element.
+
+    `enclosing` are the custom types being expanded: a type found among them is
+    a cycle, reported before fixed arrays could multiply the work.
+    """
+    if f.type_name in enclosing:
+        raise ValueError(f"custom type {f.type_name!r} contains itself (cyclic schema)")
+    name = f.field_name if not prefix else f"{prefix}/{f.field_name}"
+    if not f.is_vector:
+        names = [name]
+    elif f.array_size:
+        names = [f"{name}[{i}]" for i in range(f.array_size)]
+    else:
+        names = [f"{name}[]"]
+    subs = None
+    if not f.is_basic and f.type_name not in schema.custom_schemas:
+        if f.type_name not in schema.custom_types:
+            raise ValueError(f"type {f.type_name!r} is not defined in the schema")
+        subs = schema.custom_types[f.type_name]
+    for n in names:
+        if subs is None:  # basic type, or opaque: not expandable from the schema
+            out.append(n)
+        else:
+            for sub in subs:
+                _field_names(sub, schema, n, out, enclosing + (f.type_name,))
+
+
 def parse_snapshot(schema: Schema, active_mask: bytes, payload: bytes) -> dict[str, object]:
     """Decode one snapshot into {"field/path[i]": value}. Disabled fields are absent."""
     out: dict[str, object] = {}
@@ -453,3 +505,40 @@ def iter_snapshot_batch(registry: SchemaRegistry, batch):
     return ((schema, msg.timestamp_nsec, parse_snapshot_msg(schema, msg))
             for msg in batch.snapshots
             if (schema := registry.find(msg.schema_hash)) is not None)
+
+
+MCAP_ENCODING = "data_tamer"  # schema encoding and message encoding in MCAP (spec section 4.1)
+
+
+def iter_mcap(source, topics=None, verify_hash: bool = False):
+    """Iterate over (timestamp_nsec, topic, values) for each Data Tamer message of an MCAP file.
+
+    `source` is a path or a seekable binary file object; `topics` optionally
+    restricts the channels read. Messages come in log time order (the snapshot
+    timestamps); channels with another encoding are skipped. Needs the `mcap`
+    package (pip install "data-tamer-parser[mcap]"), imported by this call.
+    """
+    try:
+        from mcap.reader import make_reader
+    except ImportError as err:
+        raise ImportError('iter_mcap() needs the "mcap" package: '
+                          'pip install "data-tamer-parser[mcap]"') from err
+    return _iter_mcap(make_reader, source, topics, verify_hash)
+
+
+def _iter_mcap(make_reader, source, topics, verify_hash: bool):
+    if isinstance(source, (str, bytes)) or hasattr(source, "__fspath__"):
+        with open(source, "rb") as stream:
+            yield from _iter_mcap(make_reader, stream, topics, verify_hash)
+        return
+    schemas: dict[int, Schema] = {}  # by MCAP schema id
+    for mcap_schema, channel, message in make_reader(source).iter_messages(topics=topics):
+        if (mcap_schema is None or mcap_schema.encoding != MCAP_ENCODING
+                or channel.message_encoding != MCAP_ENCODING):
+            continue
+        schema = schemas.get(mcap_schema.id)
+        if schema is None:
+            schema = parse_schema(mcap_schema.data.decode("utf-8"), verify_hash=verify_hash)
+            schemas[mcap_schema.id] = schema
+        mask, payload = split_mcap_message(message.data)
+        yield message.log_time, channel.topic, parse_snapshot(schema, mask, payload)

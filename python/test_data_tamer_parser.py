@@ -1,7 +1,9 @@
 """Decodes the golden vectors from docs/wire_format/vectors with the reference decoder."""
 import array
+import io
 import json
 import pathlib
+import re
 import unittest
 from types import SimpleNamespace
 
@@ -47,6 +49,51 @@ class GoldenVectors(unittest.TestCase):
             dt.parse_schema("### version: 3\n")
         with self.assertRaises(ValueError):
             dt.parse_schema("### version: 5\n### hash: 1\n### channel_name: x\n", verify_hash=True)
+
+
+class FieldNames(unittest.TestCase):
+    """Schema.field_names() lists the decoder's names without decoding a message."""
+
+    def test_golden_schema(self):
+        schema = dt.parse_schema(read("schema.txt").decode())
+        names = schema.field_names()
+        self.assertEqual(names, [
+            "flag", "letter", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
+            "f32", "f64", "vec[]", "arr[0]", "arr[1]", "arr[2]", "arr[3]",
+            "pose/position/x", "pose/position/y", "pose/position/z", "pose/stamp",
+            "points[]/x", "points[]/y", "points[]/z"])
+        self.assertEqual(dt.parse_schema(read("schema.yaml").decode()).field_names(), names)
+        # the decoded names, in payload order, once dynamic indices become "[]"
+        for key in ("full", "masked"):
+            decoded = json.loads(read("expected.json"))[key]
+            templates = dict.fromkeys(re.sub(r"^(vec|points)\[\d+\]", r"\1[]", n) for n in decoded)
+            self.assertEqual(list(templates), [n for n in names if n in templates])
+        self.assertNotIn("i16", json.loads(read("expected.json"))["masked"])  # listed anyway
+
+    def test_nested_schema(self):
+        schema = dt.parse_schema(read("schema_nested.yaml").decode())
+        names = schema.field_names()
+        self.assertEqual(names[:-4], [f.field_name for f in schema.fields[:-1]])  # basic types
+        self.assertEqual(names[-4:], ["cart/pose/position/x", "cart/pose/position/y",
+                                      "cart/pose/position/z", "cart/pose/stamp"])
+        self.assertEqual(dt.parse_schema(read("schema_nested.txt").decode()).field_names(), names)
+
+    def test_nested_containers_and_opaque_types(self):
+        text = ("### version: 5\n### hash: 0\n### channel_name: c\n\n"
+                "Leg[2] legs\nBlob blob\nBlob[] blobs\n"
+                "=====\nMSG: Leg\nfloat32[] q\nint8[2] mode\n"
+                "=====\nMSG: Blob\nENCODING: proto\nmessage Blob {}\n")
+        self.assertEqual(dt.parse_schema(text).field_names(), [
+            "legs[0]/q[]", "legs[0]/mode[0]", "legs[0]/mode[1]",
+            "legs[1]/q[]", "legs[1]/mode[0]", "legs[1]/mode[1]", "blob", "blobs[]"])
+
+    def test_rejects_undefined_and_cyclic_types(self):
+        with self.assertRaises(ValueError):
+            dt.parse_schema("### version: 5\n### hash: 0\n### channel_name: c\n\nFoo x\n").field_names()
+        cyclic = "### version: 5\n### hash: 0\n### channel_name: c\n\nA a\n=====\nMSG: A\nA a\n"
+        for text in (cyclic, cyclic.replace("A a\n", "A[60000] a\n")):  # no blowup
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                dt.parse_schema(text).field_names()
 
 
 class YamlSchema(unittest.TestCase):
@@ -170,6 +217,60 @@ class RosMessageHelpers(unittest.TestCase):
         schema = dt.parse_schema(self.text)
         self.assertEqual(dt.parse_snapshot_msg(schema, self.snapshot_msg("snapshot_full", 0)),
                          self.expected["full"])
+
+
+def write_mcap(stream, channels):
+    """An MCAP file as MCAPSink writes it (spec section 4.1): channels are
+    (topic, schema text, [(timestamp, message body)]), plus a non Data Tamer channel."""
+    from mcap.writer import Writer
+    writer = Writer(stream)
+    writer.start(profile="data_tamer", library="test")
+    other_schema = writer.register_schema(name="Other", encoding="jsonschema", data=b"{}")
+    other = writer.register_channel(topic="other", message_encoding="json", schema_id=other_schema)
+    writer.add_message(other, log_time=5, publish_time=5, data=b"{}", sequence=1)
+    for topic, text, messages in channels:
+        schema = dt.parse_schema(text)
+        schema_id = writer.register_schema(name=f"{schema.channel_name}::{schema.hash}",
+                                           encoding="data_tamer", data=text.encode())
+        channel_id = writer.register_channel(topic=topic, message_encoding="data_tamer",
+                                             schema_id=schema_id)
+        for timestamp, body in messages:
+            writer.add_message(channel_id, log_time=timestamp, publish_time=timestamp,
+                               data=body, sequence=1)
+    writer.finish()
+
+
+class Mcap(unittest.TestCase):
+    """iter_mcap() over files built from the golden vectors with the `mcap` package."""
+
+    def setUp(self):
+        try:
+            import mcap  # noqa: F401
+        except ImportError:
+            self.skipTest("mcap not installed (pip install mcap)")
+        self.expected = json.loads(read("expected.json"))
+        full, masked = read("snapshot_full.mcap_message"), read("snapshot_masked.mcap_message")
+        self.stream = io.BytesIO()
+        write_mcap(self.stream, [
+            ("wire_test", read("schema.txt").decode(), [(30, full), (10, masked)]),
+            ("as_yaml", read("schema.yaml").decode(), [(20, full)]),
+        ])
+
+    def test_iter_mcap(self):
+        self.stream.seek(0)
+        decoded = list(dt.iter_mcap(self.stream, verify_hash=True))
+        self.assertEqual([(t, topic) for t, topic, _ in decoded],
+                         [(10, "wire_test"), (20, "as_yaml"), (30, "wire_test")])
+        self.assertEqual([v for _, _, v in decoded],
+                         [self.expected["masked"], self.expected["full"], self.expected["full"]])
+
+    def test_path_and_topics(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "log.mcap"
+            path.write_bytes(self.stream.getvalue())
+            self.assertEqual(len(list(dt.iter_mcap(path))), 3)
+            self.assertEqual([t for t, _, _ in dt.iter_mcap(str(path), topics=["as_yaml"])], [20])
 
 
 if __name__ == "__main__":
