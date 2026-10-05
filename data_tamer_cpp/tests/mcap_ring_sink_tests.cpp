@@ -18,6 +18,11 @@
 #include <variant>
 #include <vector>
 
+#include <csignal>
+#include <fstream>
+#include <iterator>
+
+#include <sys/resource.h>
 #include <unistd.h>
 
 using namespace DataTamer;
@@ -190,13 +195,22 @@ TEST(MCAPRingSink, EvictsByCapacity)
   EXPECT_EQ(stats.stored_bytes, 5 * record);
   EXPECT_EQ(stats.evicted_by_capacity, 15u);
 
-  // The wrapped records read back intact.
+  // The wrapped records read back intact. The ring could not hold the whole
+  // window: the dump reports it as truncated.
+  MCAPRingDump info;
+  sink->setDumpCallback([&](const MCAPRingDump& dump) { info = dump; });
   ASSERT_TRUE(sink->requestDump());
-  source.take(20);
+  source.take(20);  // trigger
+  source.take(21);  // completes [20 - window, 20]
   sink.drain();
   sink->waitForWriter();
+  EXPECT_TRUE(info.ok) << info.error;
+  EXPECT_TRUE(info.truncated);
+  EXPECT_EQ(info.start, nanoseconds(20 - 1'000'000));
+  EXPECT_EQ(info.first_message, nanoseconds(17));
+  EXPECT_EQ(info.last_message, nanoseconds(20));
   const auto messages = readDump(base.dump(1));
-  EXPECT_EQ(timestamps(messages), range(16, 20, 1));
+  EXPECT_EQ(timestamps(messages), range(17, 20, 1));
   for(const auto& msg : messages)
   {
     EXPECT_EQ(msg.fields.at("value"), double(msg.timestamp));
@@ -212,7 +226,7 @@ TEST(MCAPRingSink, EvictsByCapacity)
 }
 
 // The dump holds [T - window, T + post] around the first snapshot after the
-// request, in snapshot time, and completes at the first snapshot >= T + post.
+// request, in snapshot time, and completes at the first snapshot > T + post.
 TEST(MCAPRingSink, DumpCoversPreAndPostWindow)
 {
   TempBase base("window");
@@ -228,16 +242,16 @@ TEST(MCAPRingSink, DumpCoversPreAndPostWindow)
   sink.drain();
   ASSERT_TRUE(sink->requestDump(nanoseconds(50)));
   EXPECT_TRUE(sink->dumpRequested());
-  for(int64_t ts = 160; ts <= 200; ts += 10)
+  for(int64_t ts = 160; ts <= 210; ts += 10)
   {
     source.take(ts);
     sink.drain();
     EXPECT_TRUE(sink->dumpRequested()) << "post-trigger interval not over at " << ts;
   }
-  source.take(210);  // T + post: completes the dump
+  source.take(220);  // past T + post: completes the dump
   sink.drain();
   EXPECT_FALSE(sink->dumpRequested());
-  for(int64_t ts = 220; ts <= 300; ts += 10)
+  for(int64_t ts = 230; ts <= 300; ts += 10)
   {
     source.take(ts);
   }
@@ -251,6 +265,9 @@ TEST(MCAPRingSink, DumpCoversPreAndPostWindow)
   EXPECT_EQ(dumps[0].start, nanoseconds(60));
   EXPECT_EQ(dumps[0].end, nanoseconds(210));
   EXPECT_EQ(dumps[0].messages, 16u);
+  EXPECT_EQ(dumps[0].first_message, nanoseconds(60));
+  EXPECT_EQ(dumps[0].last_message, nanoseconds(210));
+  EXPECT_FALSE(dumps[0].truncated);
   EXPECT_EQ(sink->stats().dumps_written, 1u);
 
   const auto messages = readDump(base.dump(1));
@@ -281,7 +298,8 @@ TEST(MCAPRingSink, DumpContainsEveryChannel)
   }
   sink.drain();
   ASSERT_TRUE(sink->requestDump());
-  fast.take(210);
+  fast.take(210);  // trigger
+  fast.take(220);  // completes
   sink.drain();
   sink->waitForWriter();
 
@@ -321,16 +339,21 @@ TEST(MCAPRingSink, RequestsWhileActiveAreIgnored)
   EXPECT_FALSE(sink->requestDump()) << "collecting the post-trigger interval";
   source.take(30);
   sink.drain();
+  EXPECT_FALSE(sink->requestDump()) << "at T + post, not complete yet";
+  source.take(31);
+  sink.drain();
   ASSERT_FALSE(sink->dumpRequested());
-  sink->waitForWriter();
   EXPECT_TRUE(sink->requestDump()) << "handed to the writer: accepted again";
+  sink->waitForWriter();  // or dump 2 would wait for a third snapshot
   source.take(40);
+  source.take(41);
   sink.drain();
   sink->waitForWriter();
 
   EXPECT_EQ(sink->stats().dumps_written, 2u);
   EXPECT_EQ(timestamps(readDump(base.dump(1))), (std::vector<int64_t>{ 0, 10, 30 }));
-  EXPECT_EQ(timestamps(readDump(base.dump(2))), (std::vector<int64_t>{ 0, 10, 30, 40 }));
+  EXPECT_EQ(timestamps(readDump(base.dump(2))),
+            (std::vector<int64_t>{ 0, 10, 30, 31, 40 }));
 }
 
 // A finished dump that finds the writer busy waits for a later snapshot; the
@@ -356,10 +379,12 @@ TEST(MCAPRingSink, WriterBusyRetriesOnNextSnapshot)
   sink.drain();
   ASSERT_TRUE(sink->requestDump());
   source.take(60);  // dump 1: [30, 60]
+  source.take(65);
   sink.drain();
 
   ASSERT_TRUE(sink->requestDump());
-  source.take(70);  // dump 2: [40, 70], writer busy
+  source.take(70);  // dump 2: [40, 70]
+  source.take(75);  // complete, writer busy
   sink.drain();
   EXPECT_EQ(sink->stats().writer_busy_retries, 1u);
   EXPECT_TRUE(sink->dumpRequested());
@@ -368,7 +393,7 @@ TEST(MCAPRingSink, WriterBusyRetriesOnNextSnapshot)
     source.take(ts);
     sink.drain();
   }
-  EXPECT_EQ(sink->stats().writer_busy_retries, 9u);
+  EXPECT_EQ(sink->stats().writer_busy_retries, 1u) << "counted once per dump";
 
   release.set_value();
   while(callbacks.load() == 0 || sink->stats().dumps_written == 0)
@@ -382,7 +407,8 @@ TEST(MCAPRingSink, WriterBusyRetriesOnNextSnapshot)
   sink->waitForWriter();
   EXPECT_EQ(sink->stats().dumps_written, 2u);
   EXPECT_EQ(timestamps(readDump(base.dump(1))), range(30, 60, 10));
-  EXPECT_EQ(timestamps(readDump(base.dump(2))), range(40, 70, 10));
+  EXPECT_EQ(timestamps(readDump(base.dump(2))),
+            (std::vector<int64_t>{ 40, 50, 60, 65, 70 }));
 }
 
 // A request made just before shutdown, with no snapshot left to trigger it.
@@ -511,4 +537,185 @@ TEST(MCAPRingSink, RequestFromAnotherThread)
   {
     std::filesystem::remove(base.dump(size_t(n)));
   }
+}
+
+// Regression: flushPendingDump() must not hold the ring lock while it waits for
+// a busy writer, whose callback may call stats(). Waiting for the writer from
+// its own callback throws instead of deadlocking.
+TEST(MCAPRingSink, CallbackMayQueryWhileFlushWaits)
+{
+  TempBase base("callback_flush");
+  auto sink = DataTamerTest::manual<MCAPRingSink>(options(base.path, 100));
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::atomic<int> callbacks{ 0 };
+  std::atomic<int> logic_errors{ 0 };
+  MCAPRingSink* recorder = sink.sink;
+  sink->setDumpCallback([&, recorder](const MCAPRingDump&) {
+    if(callbacks.fetch_add(1) == 0)
+    {
+      released.wait();
+    }
+    (void)recorder->stats();
+    try
+    {
+      recorder->waitForWriter();
+    }
+    catch(const std::logic_error&)
+    {
+      ++logic_errors;
+    }
+    try
+    {
+      (void)recorder->flushPendingDump();
+    }
+    catch(const std::logic_error&)
+    {
+      ++logic_errors;
+    }
+  });
+  Source source("callback_flush", sink);
+  source.take(0);
+  sink.drain();
+  ASSERT_TRUE(sink->requestDump());
+  source.take(10);
+  source.take(11);  // dump 1 handed off: the writer blocks in the callback
+  sink.drain();
+  ASSERT_TRUE(sink->requestDump());
+  source.take(20);
+  source.take(21);  // dump 2 complete, pending behind the busy writer
+  sink.drain();
+  ASSERT_TRUE(sink->dumpRequested());
+
+  auto flushed =
+      std::async(std::launch::async, [recorder] { return recorder->flushPendingDump(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let it wait
+  release.set_value();
+  if(flushed.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
+  {
+    ADD_FAILURE() << "flushPendingDump() deadlocked with the dump callback";
+    std::abort();  // fail instead of hanging
+  }
+  EXPECT_TRUE(flushed.get());
+  EXPECT_EQ(callbacks.load(), 2);
+  EXPECT_EQ(logic_errors.load(), 4);
+  EXPECT_EQ(sink->stats().dumps_written, 2u);
+}
+
+// Channels queue separately, so another channel's snapshot stamped at T + post
+// may arrive after one stamped there: the dump waits for a later timestamp.
+TEST(MCAPRingSink, SnapshotsAtTheEndFromAnotherChannelAreIncluded)
+{
+  TempBase base("same_time");
+  auto sink = DataTamerTest::manual<MCAPRingSink>(options(base.path, 100));
+  Source a("a", sink);
+  Source b("b", sink);
+  ASSERT_TRUE(sink->requestDump());
+  a.take(100);  // trigger, T = end = 100
+  sink.drain();
+  b.take(100);
+  sink.drain();
+  EXPECT_TRUE(sink->dumpRequested());
+  a.take(110);  // completes
+  sink.drain();
+  sink->waitForWriter();
+  const auto messages = readDump(base.dump(1));
+  EXPECT_EQ(timestamps(messages, "a"), (std::vector<int64_t>{ 100 }));
+  EXPECT_EQ(timestamps(messages, "b"), (std::vector<int64_t>{ 100 }));
+}
+
+// The flush uses the newest timestamp seen, not the last one delivered.
+TEST(MCAPRingSink, FlushUsesTheNewestTimestamp)
+{
+  TempBase base("newest");
+  auto sink = DataTamerTest::manual<MCAPRingSink>(options(base.path, 50));
+  MCAPRingDump info;
+  sink->setDumpCallback([&](const MCAPRingDump& dump) { info = dump; });
+  Source a("a", sink);
+  Source b("b", sink);
+  a.take(300);
+  b.take(100);  // delivered last, older
+  sink.drain();
+  ASSERT_TRUE(sink->requestDump());
+  ASSERT_TRUE(sink->flushPendingDump());
+  EXPECT_TRUE(info.ok) << info.error;
+  EXPECT_EQ(info.trigger_time, nanoseconds(300));
+  EXPECT_EQ(info.start, nanoseconds(250));
+  EXPECT_EQ(info.end, nanoseconds(300));
+  EXPECT_EQ(timestamps(readDump(base.dump(1))), (std::vector<int64_t>{ 300 }));
+}
+
+// Dumps never overwrite an existing file, e.g. of a previous run.
+TEST(MCAPRingSink, SkipsExistingFileNames)
+{
+  TempBase base("existing");
+  {
+    std::ofstream(base.dump(1)) << "previous run";
+  }
+  auto sink = DataTamerTest::manual<MCAPRingSink>(options(base.path, 100));
+  MCAPRingDump info;
+  sink->setDumpCallback([&](const MCAPRingDump& dump) { info = dump; });
+  Source source("existing", sink);
+  source.take(0);
+  sink.drain();
+  ASSERT_TRUE(sink->requestDump());
+  ASSERT_TRUE(sink->flushPendingDump());
+  EXPECT_EQ(info.path, base.dump(2));
+  EXPECT_EQ(timestamps(readDump(base.dump(2))), (std::vector<int64_t>{ 0 }));
+  std::ifstream previous(base.dump(1));
+  const std::string content((std::istreambuf_iterator<char>(previous)),
+                            std::istreambuf_iterator<char>());
+  EXPECT_EQ(content, "previous run");
+}
+
+TEST(MCAPRingSink, ReportsOpenFailure)
+{
+  auto sink = DataTamerTest::manual<MCAPRingSink>(
+      options("/nonexistent_dir_data_tamer/dump.mcap", 100));
+  MCAPRingDump info;
+  sink->setDumpCallback([&](const MCAPRingDump& dump) { info = dump; });
+  Source source("open_failure", sink);
+  source.take(0);
+  sink.drain();
+  ASSERT_TRUE(sink->requestDump());
+  ASSERT_TRUE(sink->flushPendingDump());
+  EXPECT_FALSE(info.ok);
+  EXPECT_FALSE(info.error.empty());
+  EXPECT_EQ(sink->stats().dumps_failed, 1u);
+  EXPECT_EQ(sink->stats().dumps_written, 0u);
+}
+
+// A real write failure: the file size limit makes write() fail with EFBIG.
+TEST(MCAPRingSink, ReportsWriteFailure)
+{
+  TempBase base("write_failure");
+  auto sink = DataTamerTest::manual<MCAPRingSink>(options(base.path, 1'000'000));
+  MCAPRingDump info;
+  sink->setDumpCallback([&](const MCAPRingDump& dump) { info = dump; });
+  Source source("write_failure", sink);
+  for(int64_t ts = 0; ts < 500; ++ts)  // about 20 KB of records
+  {
+    source.take(ts);
+    sink.drain();
+  }
+  rlimit original{};
+  ASSERT_EQ(::getrlimit(RLIMIT_FSIZE, &original), 0);
+  if(original.rlim_max != RLIM_INFINITY && original.rlim_max < 4096)
+  {
+    GTEST_SKIP() << "file size limit already below the test size";
+  }
+  const auto previous_handler = std::signal(SIGXFSZ, SIG_IGN);
+  rlimit limited = original;
+  limited.rlim_cur = 4096;
+  ASSERT_EQ(::setrlimit(RLIMIT_FSIZE, &limited), 0);
+  ASSERT_TRUE(sink->requestDump());
+  const bool flushed = sink->flushPendingDump();
+  ::setrlimit(RLIMIT_FSIZE, &original);
+  std::signal(SIGXFSZ, previous_handler);
+
+  ASSERT_TRUE(flushed);
+  EXPECT_FALSE(info.ok);
+  EXPECT_NE(info.error.find("write failed"), std::string::npos) << info.error;
+  EXPECT_EQ(info.path, base.dump(1));
+  EXPECT_EQ(sink->stats().dumps_failed, 1u);
 }

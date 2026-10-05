@@ -17,15 +17,16 @@ namespace DataTamer
 struct MCAPRingOptions
 {
   /// Dump number N (1, 2, 3, ...) is written to details::NumberedPath(filepath, N):
-  /// "crash.mcap" -> "crash_1.mcap", "crash_2.mcap", ... The counter restarts
-  /// with every sink, so existing files of an earlier run are overwritten: use
-  /// a different filepath per run (a timestamp, for instance) to keep them.
+  /// "crash.mcap" -> "crash_1.mcap", "crash_2.mcap", ... Numbers whose file
+  /// exists already (dumps of an earlier run, for instance) are skipped, so
+  /// no file is ever overwritten.
   std::string filepath = "flight_recorder.mcap";
   /// How much history before the trigger a dump contains, in snapshot time.
   std::chrono::nanoseconds window = std::chrono::seconds(10);
   /// Size of the RAM ring. A second buffer of the same size holds the dump
   /// being written, so the sink uses about 2 * capacity_bytes. When the ring
-  /// is full the oldest snapshots are evicted, even if younger than `window`.
+  /// is full the oldest snapshots are evicted, even if younger than `window`
+  /// or part of an active dump (see MCAPRingDump::truncated).
   size_t capacity_bytes = size_t(64) * 1024 * 1024;
   /// Compress the dump files with zstd.
   bool compression = false;
@@ -37,10 +38,19 @@ struct MCAPRingDump
   std::string path;
   /// Timestamp of the snapshot that triggered the dump.
   std::chrono::nanoseconds trigger_time{ 0 };
-  /// The dump holds the stored snapshots whose timestamp is in [start, end].
+  /// Requested interval: the dump holds the stored snapshots whose timestamp
+  /// is in [start, end]. flushPendingDump() may cut `end`.
   std::chrono::nanoseconds start{ 0 };
   std::chrono::nanoseconds end{ 0 };
+  /// Timestamps of the oldest and newest message written (0 if none).
+  std::chrono::nanoseconds first_message{ 0 };
+  std::chrono::nanoseconds last_message{ 0 };
   size_t messages = 0;
+  /// The ring was full and evicted snapshots of [start, end] before the
+  /// dump was written: the file starts later than `start`. Raise capacity_bytes.
+  bool truncated = false;
+  /// False if the file could not be opened or written (disk full, I/O error):
+  /// `error` says why. A partially written file is left at `path`.
   bool ok = false;
   std::string error;
 };
@@ -49,7 +59,8 @@ struct MCAPRingStats
 {
   uint64_t dumps_written = 0;
   uint64_t dumps_failed = 0;
-  /// Finished dumps that found the writer busy and waited for a later snapshot.
+  /// Dumps that were complete but found the writer busy with the previous one,
+  /// and were handed over at a later snapshot (counted once per dump).
   uint64_t writer_busy_retries = 0;
   /// Snapshots evicted from the ring because it was full (not because of age).
   uint64_t evicted_by_capacity = 0;
@@ -79,15 +90,21 @@ struct MCAPRingStats
  * the same in simulation, replay and on hardware. With trigger time T, the
  * dump contains the stored snapshots of every channel with a timestamp in
  * [T - window, T + post_trigger], and the MCAP schema and channel records of
- * the channels that appear in it. It is complete at the first snapshot with a
- * timestamp >= T + post_trigger.
+ * the channels that appear in it. It is complete at the first delivered
+ * snapshot with a timestamp > T + post_trigger. Each channel queues its
+ * snapshots separately, so delivery is not strictly in timestamp order across
+ * channels: a snapshot of another channel stamped <= T + post_trigger but
+ * delivered after the one that completed the dump is not included.
  *
  * Real time. onSnapshot() copies mask and payload into the ring and releases
  * the pool slot at once; after the ring is allocated it allocates nothing.
  * A finished dump is copied into the second buffer and written to disk by a
  * writer thread of the sink, so the SinkWorker never waits for file I/O. If
  * the writer is still busy with the previous dump, the hand-off is retried at
- * the next snapshot, and in the meantime the ring keeps the dumped interval.
+ * the next snapshot; meanwhile age eviction spares the dumped interval (capacity
+ * eviction does not, see MCAPRingDump::truncated). The hand-off copies the
+ * records of [start, end] into the second buffer on the worker thread, a
+ * memcpy of up to capacity_bytes.
  *
  * Shutdown. A request made just before shutdown has no snapshot left to
  * trigger it: call flushPendingDump() after SinkWorker::stop(). The destructor
@@ -125,9 +142,10 @@ public:
   /**
    * @brief Write the active request, if any, with what the ring holds now,
    * and wait until it is on disk. A request no snapshot has triggered yet uses
-   * the latest stored snapshot as trigger; a dump still waiting for its
-   * post-trigger interval is cut at the latest snapshot. Call it after
+   * the newest snapshot timestamp seen as trigger; a dump still waiting for
+   * its post-trigger interval is cut at the newest timestamp seen. Call it after
    * SinkWorker::stop() (or between drain() calls with manual delivery).
+   * Never call it from the dump callback (std::logic_error).
    * Returns true if it wrote a dump (see MCAPRingDump::ok for the outcome).
    * In every case it returns after the writer has finished all dumps handed
    * to it so far.
@@ -137,7 +155,10 @@ public:
   /// Wait until the writer thread has no dump in progress.
   void waitForWriter();
 
-  /// Called on the writer thread after each dump, successful or not.
+  /// Called on the writer thread after each dump, successful or not. It may
+  /// call stats(), dumpRequested() and requestDump(); waitForWriter() and
+  /// flushPendingDump() would wait for the callback itself and throw
+  /// std::logic_error there.
   void setDumpCallback(std::function<void(const MCAPRingDump&)> callback);
 
   [[nodiscard]] MCAPRingStats stats() const;
