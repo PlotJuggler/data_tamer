@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -475,7 +476,7 @@ TEST(SinkQueue, McapAutomaticRolloverDoesNotReopenClosedAcceptance)
   for(const auto& file : std::filesystem::directory_iterator(directory))
   {
     // rollover.tamer.mcap, rollover_1.tamer.mcap, ...: the counter goes before
-    // the first dot, so the multi-part extension survives (#71, #98)
+    // the extension, so the multi-part extension survives (#71, #98)
     const auto name = file.path().filename().string();
     EXPECT_EQ(name.substr(name.find('.')), ".tamer.mcap") << file.path();
     EXPECT_TRUE(name.rfind("rollover", 0) == 0) << file.path();
@@ -579,6 +580,95 @@ TEST(SinkQueue, McapNumberedPathKeepsMultiPartExtension)
   EXPECT_EQ(NumberedPath(".hidden", 1), ".hidden_1");
   EXPECT_EQ(NumberedPath("dir/.hidden.mcap", 2), "dir/.hidden_2.mcap");
   EXPECT_EQ(NumberedPath("./run.mcap", 1), "./run_1.mcap");
+  // Dotted stems stay whole: only alphabetic trailing segments are the extension.
+  EXPECT_EQ(NumberedPath("robot_v1.2.mcap", 1), "robot_v1.2_1.mcap");
+  EXPECT_EQ(NumberedPath("log_2026.10.05.mcap", 1), "log_2026.10.05_1.mcap");
+  EXPECT_EQ(NumberedPath("data.v2.mcap", 1), "data.v2_1.mcap");
+  EXPECT_EQ(NumberedPath("log.123", 1), "log.123_1");
+  EXPECT_EQ(NumberedPath("log.", 1), "log._1");
+  EXPECT_EQ(NumberedPath("run.TAMER.Mcap", 1), "run_1.TAMER.Mcap");
+}
+
+namespace
+{
+std::vector<uint32_t> mcapSequences(const std::filesystem::path& path)
+{
+  std::vector<uint32_t> sequences;
+  mcap::McapReader reader;
+  EXPECT_TRUE(reader.open(path.string()).ok()) << path;
+  for(const auto& message : reader.readMessages())
+  {
+    sequences.push_back(message.message.sequence);
+  }
+  return sequences;
+}
+}  // namespace
+
+TEST(SinkQueue, McapRolloverRestartsSequencePerFile)
+{
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("data_tamer_rollover_seq_" + std::to_string(NsecSinceEpoch().count()));
+  std::filesystem::remove_all(directory);
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  uint64_t value = 1;
+  auto sink = manual<MCAPSink>((directory / "seq.mcap").string());
+  auto channel = channelWith(sink, &value);
+  const auto take = [&](int count) {
+    for(int i = 0; i < count; ++i)
+    {
+      ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+    }
+    sink.drain();
+  };
+  sink->setMaxTimeBeforeReset(std::chrono::seconds(0));  // no rollover
+  take(3);
+  sink->setMaxTimeBeforeReset(std::chrono::seconds(-1));  // roll over after the next
+  take(1);
+  sink->setMaxTimeBeforeReset(std::chrono::seconds(0));
+  take(3);
+  sink.worker->stop();
+  sink->stopRecording();
+  EXPECT_EQ(mcapSequences(directory / "seq.mcap"), (std::vector<uint32_t>{ 1, 2, 3, 4 }));
+  EXPECT_EQ(mcapSequences(directory / "seq_1.mcap"), (std::vector<uint32_t>{ 1, 2, 3 }));
+  std::filesystem::remove_all(directory);
+}
+
+TEST(SinkQueue, McapRolloverSkipsExistingFiles)
+{
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("data_tamer_rollover_skip_" + std::to_string(NsecSinceEpoch().count()));
+  std::filesystem::remove_all(directory);
+  ASSERT_TRUE(std::filesystem::create_directory(directory));
+  // Leftovers of a previous run with the same path (with a gap at _3).
+  for(const char* name : { "run_1.tamer.mcap", "run_2.tamer.mcap", "run_4.tamer.mcap" })
+  {
+    std::ofstream(directory / name) << "previous run";
+  }
+  uint64_t value = 1;
+  auto sink = manual<MCAPSink>((directory / "run.tamer.mcap").string());
+  sink->setMaxTimeBeforeReset(std::chrono::seconds(-1));
+  auto channel = channelWith(sink, &value);
+  for(int i = 0; i < 3; ++i)
+  {
+    ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+  }
+  sink.worker->stop();
+  sink->stopRecording();
+  for(const char* name : { "run_1.tamer.mcap", "run_2.tamer.mcap", "run_4.tamer.mcap" })
+  {
+    std::ifstream file(directory / name);
+    std::string content;
+    std::getline(file, content);
+    EXPECT_EQ(content, "previous run") << name;
+  }
+  // The three rollovers used the first unused names: _3, _5, _6.
+  EXPECT_EQ(mcapSequences(directory / "run_3.tamer.mcap"), std::vector<uint32_t>{ 1 });
+  EXPECT_EQ(mcapSequences(directory / "run_5.tamer.mcap"), std::vector<uint32_t>{ 1 });
+  EXPECT_TRUE(mcapSequences(directory / "run_6.tamer.mcap").empty());
+  EXPECT_FALSE(std::filesystem::exists(directory / "run_7.tamer.mcap"));
+  std::filesystem::remove_all(directory);
 }
 
 TEST(SinkQueue, FastConsumerCannotReleaseParentBeforeSecondFanout)
