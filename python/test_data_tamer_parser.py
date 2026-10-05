@@ -93,7 +93,18 @@ class YamlSchema(unittest.TestCase):
                     head + "fields:\n  a: float64\n  a: int8\n",     # duplicate key
                     head + "fields:\n  a: float64\n   b: int8\n",    # indentation
                     head + "fields:\n  a: [float64]\n",              # flow sequence
-                    head + 'fields:\n  "a: float64\n']:              # unterminated
+                    head + 'fields:\n  "a: float64\n',               # unterminated
+                    head + "fields:\n  a: int32[0]\n",               # extent out of range
+                    head + "fields:\n  a: int32[70000]\n",
+                    head + "fields:\n  a: int32[-1]\n",
+                    head + "fields:\n  a: int32[1_0]\n",
+                    head + 'fields:\n  a: "[3]"\n',                  # empty type
+                    head + 'fields:\n  "\\x+1": int8\n',            # bad hex escape
+                    head + 'fields:\n  "\\uD800": int8\n',          # surrogate
+                    "version: +6\nhash: 1\nchannel_name: c\nfields: {}\n",
+                    "  version: 6\n  hash: 1\n  channel_name: c\n  fields: {}\n",
+                    head + "fields:\n" + "".join("  " * (i + 1) + "k:\n" for i in range(100))
+                    + "  " * 101 + "x: int8\n"]:                      # too deep
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 dt.parse_schema(bad)
         with self.assertRaises(ValueError):
@@ -150,6 +161,10 @@ class RosMessageHelpers(unittest.TestCase):
         self.assertEqual(list(dt.iter_snapshot_batch(registry, self.batch(embed=False))), [])
         registry.add_schemas(SimpleNamespace(schemas=self.batch(embed=True).schemas))
         self.assertEqual(len(list(dt.iter_snapshot_batch(registry, self.batch(embed=False)))), 2)
+
+    def test_registry_rejects_hash_mismatch(self):
+        with self.assertRaises(ValueError):
+            dt.SchemaRegistry().add(self.schema_hash + 1, self.text)
 
     def test_single_snapshot_msg(self):
         schema = dt.parse_schema(self.text)

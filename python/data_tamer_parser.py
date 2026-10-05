@@ -63,16 +63,34 @@ class Schema:
     custom_schemas: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
+def _parse_type_spec(spec: str, name: str) -> Field:
+    """`T`, `T[]` or `T[N]` with N in 1..65535 (spec section 2)."""
+    bracket = spec.find("[")
+    type_name = spec if bracket < 0 else spec[:bracket]
+    if not type_name:
+        raise ValueError(f"empty type in {spec!r}")
+    if bracket < 0:
+        return Field(name, type_name)
+    inner = spec[bracket + 1:-1]
+    if not spec.endswith("]") or not all(c in "0123456789" for c in inner):
+        raise ValueError(f"invalid type {spec!r}")
+    if inner and not 1 <= int(inner) <= 65535:
+        raise ValueError(f"array size out of range (1..65535) in {spec!r}")
+    return Field(name, type_name, True, int(inner) if inner else 0)
+
+
 def _parse_field_line(line: str) -> Field:
     type_part, _, name = line.partition(" ")
     name = name.strip()
     if not name:
         raise ValueError(f"field line without a name: {line!r}")
-    bracket = type_part.find("[")
-    if bracket < 0:
-        return Field(name, type_part)
-    inner = type_part[bracket + 1:type_part.index("]", bracket)]
-    return Field(name, type_part[:bracket], True, int(inner) if inner else 0)
+    return _parse_type_spec(type_part, name)
+
+
+def _parse_uint(value: str, what: str) -> int:
+    if not value or len(value) > 20 or not all(c in "0123456789" for c in value):
+        raise ValueError(f"invalid {what} {value!r}")
+    return int(value)
 
 
 def schema_hash(text: str) -> int:
@@ -181,9 +199,12 @@ def _read_quoted(s: str, line: str) -> tuple[str, str]:
             elif e in _HEX_ESCAPES:
                 n = _HEX_ESCAPES[e]
                 digits = s[i + 2:i + 2 + n]
-                if len(digits) != n:
+                if len(digits) != n or not all(c in "0123456789abcdefABCDEF" for c in digits):
                     raise ValueError(f"bad escape in {line!r}")
-                out.append(chr(int(digits, 16)))
+                cp = int(digits, 16)
+                if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+                    raise ValueError(f"bad escape in {line!r}")
+                out.append(chr(cp))
                 i += 2 + n
             else:
                 raise ValueError(f"bad escape in {line!r}")
@@ -250,6 +271,8 @@ def _parse_yaml_tree(text: str) -> list:
             raise ValueError(f"duplicate key {key!r}")
         level[2].add(key)
         if rest == "":
+            if len(stack) > MAX_SCHEMA_DEPTH:
+                raise ValueError(f"nesting too deep in {line!r}")
             children: list = []
             level[1].append((key, None, children))
             stack.append([None, children, set()])
@@ -259,16 +282,6 @@ def _parse_yaml_tree(text: str) -> list:
         else:
             level[1].append((key, _scalar(rest, line), None))
     return root
-
-
-def _parse_type_spec(spec: str, name: str) -> Field:
-    bracket = spec.find("[")
-    if bracket < 0:
-        return Field(name, spec)
-    if not spec.endswith("]"):
-        raise ValueError(f"bad type {spec!r}")
-    inner = spec[bracket + 1:-1]
-    return Field(name, spec[:bracket], True, int(inner) if inner else 0)
 
 
 def _flatten(nodes: list, prefix: str, out: list[Field]) -> None:
@@ -300,9 +313,10 @@ def _parse_schema_yaml(text: str, verify_hash: bool) -> Schema:
             raise ValueError(f"YAML schema: {key!r} must be a mapping")
         return top[key][1]
 
-    if int(scalar("version")) != SCHEMA_YAML_VERSION:
+    if _parse_uint(scalar("version"), "version") != SCHEMA_YAML_VERSION:
         raise ValueError(f"unsupported YAML schema version {scalar('version')!r}")
-    schema = Schema(channel_name=scalar("channel_name"), hash=int(scalar("hash")))
+    schema = Schema(channel_name=scalar("channel_name"),
+                    hash=_parse_uint(scalar("hash"), "hash"))
     _flatten(mapping("fields", True), "", schema.fields)
     for type_name, value, children in mapping("types", False):
         if children is None:
@@ -405,6 +419,9 @@ class SchemaRegistry:
         schema = self._schemas.get(hash_value)
         if schema is None:
             schema = parse_schema(schema_text, verify_hash=self.verify_hash)
+            if schema.hash != hash_value:
+                # snapshots carry hash_value: this schema would never match them
+                raise ValueError(f"schema text declares hash {schema.hash}, expected {hash_value}")
             self._schemas[hash_value] = schema
         return schema
 
@@ -426,13 +443,13 @@ def parse_snapshot_msg(schema: Schema, msg) -> dict[str, object]:
 
 
 def iter_snapshot_batch(registry: SchemaRegistry, batch):
-    """Yield (schema, timestamp_nsec, values) for each snapshot of a SnapshotBatch.
+    """Iterate over (schema, timestamp_nsec, values) for each snapshot of a SnapshotBatch.
 
-    The schemas embedded in the batch are added to `registry` first; snapshots
-    whose schema is still unknown are skipped.
+    The schemas embedded in the batch are added to `registry` right away, when
+    this is called (a malformed one raises ValueError); snapshots whose schema
+    is still unknown are skipped.
     """
     registry.add_schemas(batch)
-    for snapshot_msg in batch.snapshots:
-        schema = registry.find(snapshot_msg.schema_hash)
-        if schema is not None:
-            yield schema, snapshot_msg.timestamp_nsec, parse_snapshot_msg(schema, snapshot_msg)
+    return ((schema, msg.timestamp_nsec, parse_snapshot_msg(schema, msg))
+            for msg in batch.snapshots
+            if (schema := registry.find(msg.schema_hash)) is not None)

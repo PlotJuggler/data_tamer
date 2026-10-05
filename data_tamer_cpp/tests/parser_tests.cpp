@@ -8,6 +8,7 @@
 #include <thread>
 #include <variant>
 #include <cstring>
+#include <locale>
 #include <string>
 
 using namespace DataTamerParser;
@@ -572,10 +573,73 @@ TEST(DataTamerParser, YamlSchemaRejectsMalformedInput)
                std::runtime_error);
   EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  a: float64\n", true),
                std::runtime_error);  // wrong hash
+  // numbers too large for uint64 / an array extent: runtime_error, not out_of_range
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  a: "
+                                          "int32[99999999999999999999999]\n"),
+               std::runtime_error);
+  EXPECT_THROW(BuildSchemaFromText("version: 6\nhash: "
+                                   "99999999999999999999\nchannel_name: "
+                                   "c\nfields: {}\n"),
+               std::runtime_error);
+  EXPECT_THROW(BuildSchemaFromText(head + "fields:\n  \"\\uD800\": int8\n"),
+               std::runtime_error);  // surrogate
+  EXPECT_THROW(BuildSchemaFromText("  version: 6\n  hash: 1\n  channel_name: c\n  "
+                                   "fields: {}\n"),
+               std::runtime_error);  // top level must start at column 0
   std::string deep = head + "fields:\n";
   for(int i = 0; i < 100; i++)
   {
     deep += std::string(size_t(2 * (i + 1)), ' ') + "k:\n";
   }
   EXPECT_THROW(BuildSchemaFromText(deep), std::runtime_error);
+}
+
+TEST(DataTamerParser, YamlSchemaIsLocaleIndependentAndEscapesLineBreaks)
+{
+  // a global locale with digit grouping must not leak into the hash line
+  struct Grouping : std::numpunct<char>
+  {
+    char do_thousands_sep() const override { return ','; }
+    std::string do_grouping() const override { return "\3"; }
+  };
+  const std::locale previous =
+      std::locale::global(std::locale(std::locale(), new Grouping));
+
+  DataTamer::Schema schema;
+  schema.channel_name = "line\u2028sep";
+  // NEL, LS and PS are line breaks for YAML 1.1 loaders: they must be escaped
+  schema.fields = { { "a\u0085b", DataTamer::BasicType::INT8, "", false, 0 },
+                    { "c\u2029d", DataTamer::BasicType::INT8, "", false, 0 },
+                    { "caf\u00e9", DataTamer::BasicType::INT8, "", false, 0 } };
+  schema.hash = DataTamer::ComputeSchemaHash(schema);
+  const auto yaml = DataTamer::ToYaml(schema);
+  std::locale::global(previous);
+
+  EXPECT_NE(yaml.find("hash: " + std::to_string(schema.hash) + "\n"), std::string::npos)
+      << yaml;
+  EXPECT_EQ(yaml.find("\u2028"), std::string::npos);
+  EXPECT_EQ(yaml.find("\u2029"), std::string::npos);
+  EXPECT_EQ(yaml.find("\u0085"), std::string::npos);
+  EXPECT_NE(yaml.find("\"line\\u2028sep\""), std::string::npos) << yaml;
+  EXPECT_NE(yaml.find("\"a\\x85b\""), std::string::npos) << yaml;
+  EXPECT_NE(yaml.find("\"caf\u00e9\""), std::string::npos) << yaml;  // other UTF-8 as is
+
+  const auto parsed = BuildSchemaFromText(yaml, true);
+  EXPECT_EQ(parsed.channel_name, "line\u2028sep");
+  ASSERT_EQ(parsed.fields.size(), 3u);
+  EXPECT_EQ(parsed.fields[0].field_name, "a\u0085b");
+  EXPECT_EQ(parsed.fields[1].field_name, "c\u2029d");
+}
+
+TEST(DataTamerParser, SchemaRegistryRejectsHashMismatch)
+{
+  DataTamer::Schema schema;
+  schema.channel_name = "c";
+  schema.fields = { { "a", DataTamer::BasicType::INT8, "", false, 0 } };
+  schema.hash = DataTamer::ComputeSchemaHash(schema);
+  DataTamerParser::SchemaRegistry registry;
+  EXPECT_THROW(registry.add(schema.hash + 1, DataTamer::ToStr(schema)),
+               std::runtime_error);
+  EXPECT_EQ(registry.size(), 0u);
+  EXPECT_EQ(registry.add(schema.hash, DataTamer::ToYaml(schema)).fields.size(), 1u);
 }

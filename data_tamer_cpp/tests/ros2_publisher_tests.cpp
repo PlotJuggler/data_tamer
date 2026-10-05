@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <optional>
+#include <thread>
 #include <string>
 
 using namespace DataTamer;
@@ -243,6 +244,61 @@ TEST(DataTamerROS2Publisher, AggregateFlushWithoutSchemas)
   ASSERT_TRUE(batch.has_value());
   EXPECT_EQ(batch->snapshots.size(), 3u);
   EXPECT_TRUE(batch->schemas.empty());
+}
+
+TEST(DataTamerROS2Publisher, AggregateByDelay)
+{
+  auto node = std::make_shared<rclcpp::Node>("test_datatamer_aggregate_delay");
+  ROS2PublisherOptions options;
+  options.aggregate = true;
+  options.max_batch_size = 1000;
+  options.max_batch_delay = std::chrono::milliseconds(5);
+  auto ros2_sink = ROS2PublisherSink::create(node, "test_aggregate_delay", options);
+
+  auto channel = ChannelsRegistry::Global().getChannel("channel_aggregate_delay");
+  channel->addDataSink(ros2_sink);
+  double const value = 1.;
+  channel->registerValue("value", &value);
+
+  // the second snapshot arrives after the delay: it closes a batch of two
+  auto batch = receiveBatch(node, "test_aggregate_delay", [&] {
+    ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+    ros2_sink->drain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+    ros2_sink->drain();
+  });
+  ASSERT_TRUE(batch.has_value());
+  EXPECT_EQ(batch->snapshots.size(), 2u);
+}
+
+TEST(DataTamerROS2Publisher, DestructorPublishesPendingBatch)
+{
+  auto node = std::make_shared<rclcpp::Node>("test_datatamer_aggregate_destructor");
+  ROS2PublisherOptions options;
+  options.aggregate = true;
+  options.max_batch_size = 1000;
+  options.max_batch_delay = std::chrono::milliseconds(0);
+
+  auto batch = receiveBatch(node, "test_aggregate_destructor", [&] {
+    // a new sink (and publisher) per attempt; give it time to match the subscriber
+    auto ros2_sink =
+        ROS2PublisherSink::create(node, "test_aggregate_destructor", options);
+    auto channel = LogChannel::create("channel_aggregate_destructor");
+    channel->addDataSink(ros2_sink);
+    double const value = 1.;
+    channel->registerValue("value", &value);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    for(int i = 0; i < 3; i++)
+    {
+      ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+    }
+    ros2_sink->drain();
+    channel->removeDataSink(ros2_sink);
+    ros2_sink.reset();  // the last owner: the sink flushes in its destructor
+  });
+  ASSERT_TRUE(batch.has_value());
+  EXPECT_EQ(batch->snapshots.size(), 3u);
 }
 
 TEST(DataTamerROS2Publisher, AggregateWithYamlSchemas)

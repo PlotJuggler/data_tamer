@@ -191,18 +191,21 @@ levels. Decoders must not rely on these choices: only the keys define the names.
 
 Syntax is a strict subset of YAML 1.2 that YAML 1.1 loaders read the same way:
 
-- Block mappings only, indented with spaces (the writer uses 2 per level;
-  siblings must share their indentation). No tabs, sequences, flow collections
+- Block mappings only, indented with spaces: the top level starts at column 0,
+  the writer uses 2 more per level, and siblings must share their indentation. No tabs, sequences, flow collections
   other than `{}`, anchors, tags, multi-line scalars or trailing comments.
   Full-line `#` comments are allowed.
 - A key or value is plain when it matches `[A-Za-z_][A-Za-z0-9_./-]*` (keys,
   names) or `[A-Za-z_][A-Za-z0-9_]*(\[[0-9]*\])?` (type specs) and is not, in
   lower case, one of `y n yes no on off true false null`. Otherwise it is
-  double-quoted with the escapes `\" \\ \n \t \r \xHH` (the writer uses `\xHH`
-  for the remaining control characters; decoders also accept `\/ \0 \uHHHH
-  \UHHHHHHHH`). Other characters are written as UTF-8.
+  double-quoted with the escapes `\" \\ \n \t \r \xHH \uHHHH` (the writer uses
+  `\xHH` for the remaining control characters and for U+0085, `\u2028` and
+  `\u2029` for U+2028 and U+2029, which YAML 1.1 treats as line breaks even
+  inside quotes; decoders also accept `\/ \0 \UHHHHHHHH`, and reject surrogate
+  code points). Other characters are written as UTF-8.
 - Duplicate keys in a mapping are an error. Decoders bound the nesting depth
-  (the reference decoders reject more than 64 levels).
+  (the reference decoders reject more than 64 levels). `version` and `hash` are
+  unsigned decimal integers (digits only).
 
 To verify the hash of a YAML schema, render it back to the line format of
 section 2 (field lines in order, custom types then opaque types sorted by name
@@ -388,7 +391,9 @@ A decoder conforms when it reproduces `expected.json` from the vectors
 directory the way `python/test_data_tamer_parser.py` does: parse `schema.txt`
 and recompute its hash,
 parse `schema.yaml` and `schema_nested.yaml` (if it reads version 6) to the
-same schemas as `schema.txt` and `schema_nested.txt`, hashes included,
+same schemas as `schema.txt` and `schema_nested.txt`, hashes included (neither
+has an opaque type: the C++ line-format parser does not read those, while
+both YAML readers do),
 decode both snapshots from mask and payload (disabled fields absent, not zero;
 floats compared bit-exactly), split both `.mcap_message` bodies into the same
 mask and payload bytes, and reject a payload with trailing bytes or a schema

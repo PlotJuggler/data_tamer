@@ -300,9 +300,23 @@ void WriteQuoted(std::ostream& os, std::string_view s)
 {
   static const char* kHex = "0123456789ABCDEF";
   os << '"';
-  for(const char c : s)
+  for(size_t i = 0; i < s.size(); i++)
   {
+    const char c = s[i];
     const auto byte = static_cast<uint8_t>(c);
+    // YAML 1.1 loaders treat NEL, LS and PS as line breaks even inside quotes
+    if(s.substr(i, 2) == "\xC2\x85")
+    {
+      os << "\\x85";
+      i += 1;
+      continue;
+    }
+    if(s.substr(i, 3) == "\xE2\x80\xA8" || s.substr(i, 3) == "\xE2\x80\xA9")
+    {
+      os << (s[i + 2] == '\xA8' ? "\\u2028" : "\\u2029");
+      i += 2;
+      continue;
+    }
     switch(c)
     {
       case '"':
@@ -463,6 +477,7 @@ void WriteFields(std::ostream& os, const FieldsVector& fields, int indent)
 std::string ToYaml(const Schema& schema)
 {
   std::ostringstream os;
+  os.imbue(std::locale::classic());  // the hash is written here: never locale-dependent
   os << "version: " << SCHEMA_YAML_VERSION << "\n";
   os << "hash: " << schema.hash << "\n";
   os << "channel_name: ";

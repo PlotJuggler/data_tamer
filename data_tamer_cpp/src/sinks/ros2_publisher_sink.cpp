@@ -80,7 +80,7 @@ void ROS2PublisherSink::create_publishers(const std::string& topic_prefix)
   {
     _p->batch_publisher = rclcpp::create_publisher<data_tamer_msgs::msg::SnapshotBatch>(
         _p->node_interface, topic_prefix + "/data_batch", data_qos);
-    _p->batch_msg.snapshots.reserve(_p->options.max_batch_size);
+    _p->batch_msg.snapshots.reserve(std::min<size_t>(_p->options.max_batch_size, 1024));
   }
   else
   {

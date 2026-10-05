@@ -147,6 +147,7 @@ class SchemaRegistry
 {
 public:
   /// Parses and stores `schema_text` under `hash`, unless `hash` is already known.
+  /// Throws std::runtime_error if the text is malformed or declares another hash.
   const Schema& add(uint64_t hash, const std::string& schema_text);
 
   /// Adds every entry of `msg.schemas` (each with `hash` and `schema_text`):
@@ -170,8 +171,9 @@ SnapshotView ToSnapshotView(const SnapshotMsgT& msg);
 
 /**
  * @brief Visits every snapshot of a data_tamer_msgs SnapshotBatch, in order.
- * The schemas embedded in the batch are added to `registry` first. Snapshots
- * whose schema is not in the registry are skipped.
+ * The schemas embedded in the batch are added to `registry` first (a malformed
+ * one throws, see SchemaRegistry::add, before any snapshot is visited).
+ * Snapshots whose schema is not in the registry are skipped.
  *
  * Callback signature: void(const Schema& schema, const SnapshotView& snapshot),
  * typically calling ParseSnapshot(schema, snapshot, ...).
@@ -462,7 +464,7 @@ inline size_t ReadQuoted(const std::string& s, size_t pos, std::string& out,
         YamlError("bad escape", line);
       }
       const auto cp = static_cast<uint32_t>(std::stoul(hex, nullptr, 16));
-      if(cp > 0x10FFFF)
+      if(cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
       {
         YamlError("bad escape", line);
       }
@@ -541,7 +543,7 @@ inline std::vector<YamlNode> ParseYamlTree(const std::string& txt)
     std::vector<YamlNode>* entries;
   };
   std::vector<YamlNode> root;
-  std::vector<Level> stack = { { -1, std::nullopt, &root } };
+  std::vector<Level> stack = { { -1, 0, &root } };  // top level starts at column 0
 
   std::istringstream ss(txt);
   std::string line;
@@ -631,7 +633,7 @@ inline TypeField ParseYamlTypeSpec(const std::string& spec)
     }
     if(!inner.empty())
     {
-      const unsigned long long extent = std::stoull(inner);
+      const unsigned long long extent = inner.size() > 5 ? 0 : std::stoull(inner);
       if(extent == 0 || extent > 65535)
       {
         throw std::runtime_error("DataTamerParser: YAML schema: array size out of "
@@ -704,12 +706,21 @@ inline Schema BuildSchemaFromYaml(const std::string& txt, bool check_hash = fals
     return node ? &node->children : nullptr;
   };
   auto toUint = [](const std::string& value, const char* what) {
-    if(value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+    if(value.empty() || value.size() > 20 ||
+       value.find_first_not_of("0123456789") != std::string::npos)
     {
       throw std::runtime_error(std::string("DataTamerParser: YAML schema: invalid ") +
                                what);
     }
-    return std::stoull(value);
+    try
+    {
+      return std::stoull(value);
+    }
+    catch(const std::out_of_range&)
+    {
+      throw std::runtime_error(std::string("DataTamerParser: YAML schema: invalid ") +
+                               what);
+    }
   };
 
   if(toUint(scalar("version"), "version") != SCHEMA_YAML_VERSION)
@@ -1080,7 +1091,15 @@ inline const Schema& SchemaRegistry::add(uint64_t hash, const std::string& schem
   auto it = schemas_.find(hash);
   if(it == schemas_.end())
   {
-    it = schemas_.emplace(hash, BuildSchemaFromText(schema_text)).first;
+    Schema schema = BuildSchemaFromText(schema_text);
+    if(schema.hash != hash)
+    {
+      // snapshots carry `hash`: a schema declaring another one would never match them
+      throw std::runtime_error("DataTamerParser: schema text declares hash " +
+                               std::to_string(schema.hash) + ", expected " +
+                               std::to_string(hash));
+    }
+    it = schemas_.emplace(hash, std::move(schema)).first;
   }
   return it->second;
 }
