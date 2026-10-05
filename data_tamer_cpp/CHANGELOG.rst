@@ -13,6 +13,14 @@ Unreleased
   ``run.tamer_1.mcap``).
 * MCAP messages carry a per-channel ``sequence`` number (1, 2, 3, ... per MCAP
   channel and file) instead of always 1, so readers can detect gaps (#98).
+* New ``data_tamer/sinks/mcap_encoding.hpp`` (#96): header-only helpers
+  ``mcap_encoding::addChannel()``, ``writeSnapshot()`` (for a ``Snapshot``),
+  ``writeMessage()`` (from a timestamp and mask and payload spans, e.g.
+  for stored data) and ``encodeMessageBody()`` that write the MCAP records of
+  ``docs/wire_format.md``. ``MCAPSink`` uses them. The caller provides the
+  sequence number and a reusable scratch buffer (no allocation once it is large
+  enough). The ``DataSink`` documentation now explains that a slow
+  ``onSnapshot()`` exhausts the channel's shared snapshot pool for every sink.
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /

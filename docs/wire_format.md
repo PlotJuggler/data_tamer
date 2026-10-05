@@ -184,6 +184,11 @@ their own clock.
 
 ### 4.1 MCAP (`MCAPSink`)
 
+`MCAPSink` writes these records with the header-only helpers in
+`data_tamer/sinks/mcap_encoding.hpp` (`addChannel`, `writeSnapshot`,
+`writeMessage`, `encodeMessageBody`); any other C++ writer, for example one that
+stores snapshots and writes them later, should use them too.
+
 - Writer profile: `data_tamer`. Compression: none, or `zstd` when enabled.
 - One MCAP **schema** record per channel schema: `name` = `<channel_name>::<hash>`,
   `encoding` = `data_tamer`, `data` = the schema text of section 2.

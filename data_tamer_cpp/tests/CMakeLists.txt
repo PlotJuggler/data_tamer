@@ -19,6 +19,7 @@ set(DATATAMER_TEST_SOURCES
     abi_tests.cpp
     locked_reference_tests.cpp
     serialize_me_tests.cpp
+    mcap_encoding_tests.cpp
     wire_format_tests.cpp)
 
 # look for gtest from ROS, but only when building for ROS 2
@@ -73,5 +74,7 @@ endif()
 # C++20 on recent distributions, so it cannot promise C++17 regardless of us.
 add_library(public_headers_cxx17 OBJECT public_headers_cxx17.cpp)
 target_include_directories(public_headers_cxx17 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+# sinks/mcap_encoding.hpp includes the MCAP headers.
+target_link_libraries(public_headers_cxx17 PRIVATE ${DATA_TAMER_MCAP_TARGET})
 set_target_properties(public_headers_cxx17 PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
