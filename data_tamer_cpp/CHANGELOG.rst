@@ -21,7 +21,9 @@ Unreleased
 * YAML schema rendering (wire format version 6, section 2.1): ``ToYaml(schema)``
   writes the same schema as YAML, nesting fields whose names share a
   ``/``-separated prefix, which is shorter for path-like names (the hash is
-  unchanged). Opt in for ROS with ``ROS2PublisherOptions::yaml_schemas``.
+  unchanged). ``RenderSchema(schema, SchemaFormat)`` picks either rendering;
+  opt in for ROS with ``ROS2PublisherOptions::schema_format =
+  SchemaFormat::Yaml``.
   ``BuildSchemaFromText()`` and the Python ``parse_schema()`` detect and read
   both renderings without dependencies, and verify a YAML schema's hash via
   ``ToText()`` / ``to_text()``. The parser's ``Schema`` gains

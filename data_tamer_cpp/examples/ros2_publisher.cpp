@@ -21,7 +21,10 @@ int main(int argc, char* argv[])
   {
     const std::string arg = argv[i];
     options.aggregate |= (arg == "--aggregate");
-    options.yaml_schemas |= (arg == "--yaml");
+    if(arg == "--yaml")
+    {
+      options.schema_format = SchemaFormat::Yaml;
+    }
   }
   auto ros2_sink = ROS2PublisherSink::create(node, "test", options);
   ChannelsRegistry::Global().addDefaultSink(ros2_sink);

@@ -39,12 +39,11 @@ struct ROS2PublisherOptions
   /// contains, so that a batch can be decoded on its own, without
   /// `<topic_prefix>/schemas` (which is published anyway).
   bool embed_schemas = true;
-  /// Write `schema_text` as YAML (ToYaml(), schema version 6), which is shorter
-  /// when field names are "/"-separated paths, instead of the default text
-  /// (ToStr(), version 5). Applies to `<topic_prefix>/schemas` and to embedded
-  /// schemas. The parsers detect the format; readers that predate it (e.g.
-  /// older PlotJuggler releases) only understand the text format.
-  bool yaml_schemas = false;
+  /// Rendering of every `schema_text`, on `<topic_prefix>/schemas` and in
+  /// embedded schemas. SchemaFormat::Yaml is shorter when field names are
+  /// "/"-separated paths, but readers that predate it (e.g. older PlotJuggler
+  /// releases) only understand SchemaFormat::Text.
+  SchemaFormat schema_format = SchemaFormat::Text;
 };
 
 /// Publishes schemas and snapshots on `<topic_prefix>/schemas` and

@@ -134,7 +134,7 @@ Grammar, in the order lines appear:
 ### 2.1 YAML rendering (version 6)
 
 The same schema can be written as YAML. It is opt-in (`ToYaml()`;
-`ROS2PublisherOptions::yaml_schemas`); MCAP files keep the line format. When
+`ROS2PublisherOptions::schema_format = SchemaFormat::Yaml`); MCAP files keep the line format. When
 field names are `/`-separated paths it is shorter, because a shared prefix is
 written once (`schema_nested.txt` vs `schema_nested.yaml` in the vectors
 directory):
@@ -306,7 +306,7 @@ Topics under a user-chosen prefix:
   were taken. When `embed_schemas` is set (the default), `schemas` holds the
   schema of every snapshot in the batch, each once, so a batch decodes on its
   own; otherwise it is empty and the `schemas` topic is needed.
-- With `yaml_schemas`, every `schema_text` (on both topics) is the YAML
+- With `schema_format = SchemaFormat::Yaml`, every `schema_text` (on both topics) is the YAML
   rendering of section 2.1.
 
 `ForEachSnapshotInBatch()` (C++ parser) and `iter_snapshot_batch()` (Python)
