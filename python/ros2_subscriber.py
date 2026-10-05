@@ -24,8 +24,9 @@ class DataTamerSubscriber(Node):
         super().__init__("data_tamer_subscriber")
         self.registry = dt.SchemaRegistry()
         self.max_values = max_values
-        # the publisher latches the schemas: subscribe transient-local to get them late
-        latched = QoSProfile(history=HistoryPolicy.KEEP_ALL,
+        # the publisher latches the latest complete schema catalog: subscribe
+        # transient-local to get it late
+        latched = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                              reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         data = QoSProfile(history=HistoryPolicy.KEEP_ALL,

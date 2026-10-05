@@ -4,6 +4,15 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* ``ROS2PublisherSink`` QoS is bounded (2.0 review item 18). The data topic
+  (``data`` or ``data_batch``) uses the new ``ROS2PublisherOptions::data_qos``,
+  by default reliable ``KeepLast(100)`` instead of ``KeepAll``, so a slow or
+  stalled subscriber no longer makes the publishing process grow without bound.
+  ``schemas`` is reliable, transient-local ``KeepLast(1)``: every message is the
+  complete catalog, so a late subscriber still gets all schemas. The catalog is
+  published as soon as the sink learns a schema (``prepare()``, or
+  ``addDataSink()`` on a prepared channel) instead of with the next snapshot; a
+  failed publication is retried by the next snapshot or ``flush()``.
 * ``ROS2PublisherSink`` can aggregate snapshots: pass ``ROS2PublisherOptions``
   with ``aggregate = true`` to publish ``data_tamer_msgs/SnapshotBatch`` on
   ``<prefix>/data_batch`` instead of one ``Snapshot`` per sample on
