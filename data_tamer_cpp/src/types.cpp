@@ -123,6 +123,11 @@ uint64_t SchemaTextHash(std::string_view text)
   return hash;
 }
 
+std::string RenderSchema(const Schema& schema, SchemaFormat format)
+{
+  return format == SchemaFormat::Yaml ? ToYaml(schema) : ToStr(schema);
+}
+
 uint64_t ComputeSchemaHash(const Schema& schema)
 {
   return SchemaTextHash(ToStr(schema));

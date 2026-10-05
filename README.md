@@ -229,7 +229,7 @@ options.aggregate = true;
 options.max_batch_size = 100;                             // snapshots per message...
 options.max_batch_delay = std::chrono::milliseconds(100);  // ...or this old, checked per snapshot
 options.embed_schemas = true;  // each batch carries its schemas: self-contained
-options.yaml_schemas = true;   // optional: shorter YAML schemas, see docs/wire_format.md 2.1
+options.schema_format = DataTamer::SchemaFormat::Yaml;  // optional: shorter schemas, docs/wire_format.md 2.1
 
 auto sink = DataTamer::ROS2PublisherSink::create(node, "/robot", options);
 channel->addDataSink(sink);

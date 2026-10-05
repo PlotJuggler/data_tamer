@@ -112,7 +112,7 @@ void ROS2PublisherSink::onSchema(const Schema& schema)
   data_tamer_msgs::msg::Schema schema_msg;
   schema_msg.hash = schema.hash;
   schema_msg.channel_name = schema.channel_name;
-  schema_msg.schema_text = _p->options.yaml_schemas ? ToYaml(schema) : ToStr(schema);
+  schema_msg.schema_text = RenderSchema(schema, _p->options.schema_format);
 
   std::lock_guard lock(_p->mutex);
   _p->schemas[schema.hash] = std::move(schema_msg);

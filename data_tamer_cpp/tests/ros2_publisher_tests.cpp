@@ -309,7 +309,7 @@ TEST(DataTamerROS2Publisher, AggregateWithYamlSchemas)
   ROS2PublisherOptions options;
   options.aggregate = true;
   options.max_batch_size = 2;
-  options.yaml_schemas = true;
+  options.schema_format = SchemaFormat::Yaml;
   auto ros2_sink = ROS2PublisherSink::create(node, "test_aggregate_yaml", options);
 
   auto channel = ChannelsRegistry::Global().getChannel("channel_aggregate_yaml");

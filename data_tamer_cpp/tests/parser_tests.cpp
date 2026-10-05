@@ -547,6 +547,9 @@ TEST(DataTamerParser, YamlSchemaRoundTrip)
   EXPECT_EQ(parsed.custom_schemas.at("Blob").encoding, "proto\"buf");
   EXPECT_EQ(parsed.custom_schemas.at("Blob").schema, "line 1\n\tline \"2\"\x01\nlast");
   EXPECT_EQ(ToText(parsed), DataTamer::ToStr(schema));
+  EXPECT_EQ(DataTamer::RenderSchema(schema, DataTamer::SchemaFormat::Yaml), yaml);
+  EXPECT_EQ(DataTamer::RenderSchema(schema, DataTamer::SchemaFormat::Text),
+            DataTamer::ToStr(schema));
 
   // empty mappings
   DataTamer::Schema empty;
