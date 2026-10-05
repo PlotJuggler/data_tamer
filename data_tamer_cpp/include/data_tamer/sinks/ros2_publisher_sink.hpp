@@ -65,8 +65,13 @@ struct ROS2PublisherOptions
 /// depth 1: a late subscriber receives the latest catalog. It is published as
 /// soon as the sink learns a schema, i.e. by LogChannel::prepare() (explicit or
 /// from the first takeSnapshot()) or by addDataSink() on a prepared channel, on
-/// the calling thread. If that publish fails, the catalog is retried on the next
-/// snapshot or flush(), where a failure is reported by the SinkWorker.
+/// the calling thread. If that publish fails, prepare() still succeeds and the
+/// catalog stays pending: the next snapshot retries it (a failure is counted by
+/// the SinkWorker, see SinkWorker::errors()), and so does flush() (a failure
+/// throws to its caller).
+///
+/// Call LogChannel::prepare() explicitly outside the control loop: otherwise the
+/// first takeSnapshot() prepares the channel, which includes this DDS write.
 class ROS2PublisherSink : public DataSink
 {
 public:
@@ -87,7 +92,8 @@ public:
   }
 
   /// Publishes the pending batch, if any (the destructor does it too), and
-  /// the schema catalog if its last publication failed.
+  /// the schema catalog if its last publication failed (also without
+  /// aggregation). Throws if a publication fails.
   /// Thread-safe: may be called from any thread, e.g.
   /// `worker->as<ROS2PublisherSink>().flush()` after `worker->drain()`.
   void flush();

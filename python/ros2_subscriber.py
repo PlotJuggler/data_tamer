@@ -29,8 +29,11 @@ class DataTamerSubscriber(Node):
         latched = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                              reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        data = QoSProfile(history=HistoryPolicy.KEEP_ALL,
-                          reliability=ReliabilityPolicy.RELIABLE)
+        # best effort matches both a reliable publisher (the default data_qos) and
+        # a best-effort one, whereas a reliable subscriber would receive nothing
+        # from a best-effort publisher. The price is that samples may be lost.
+        data = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=100,
+                          reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Schemas, prefix + "/schemas", self.registry.add_schemas, latched)
         self.create_subscription(Snapshot, prefix + "/data", self.on_snapshot, data)
         self.create_subscription(SnapshotBatch, prefix + "/data_batch", self.on_batch, data)

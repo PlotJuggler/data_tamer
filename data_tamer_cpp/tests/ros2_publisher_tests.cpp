@@ -1,4 +1,5 @@
 #include "data_tamer/data_tamer.hpp"
+#include "data_tamer/sinks/dummy_sink.hpp"
 #include "data_tamer/sinks/ros2_publisher_sink.hpp"
 
 #include "data_tamer_msgs/msg/schemas.hpp"
@@ -347,12 +348,56 @@ TEST(DataTamerROS2Publisher, AggregateWithYamlSchemas)
   EXPECT_EQ(names.front(), "robot/arm/value");
 }
 
+namespace
+{
+// Subscribes late to `<prefix>/schemas` with a KeepAll transient-local reader, so
+// that every sample the writer retains is delivered, and collects messages
+// until 300 ms after the first one.
+std::vector<data_tamer_msgs::msg::Schemas> receiveRetainedSchemas(
+    const std::shared_ptr<rclcpp::Node>& node, const std::string& prefix)
+{
+  rclcpp::QoS latched{ rclcpp::KeepAll() };
+  latched.reliable();
+  latched.transient_local();
+  std::vector<data_tamer_msgs::msg::Schemas> received;
+  auto sub = node->create_subscription<data_tamer_msgs::msg::Schemas>(
+      prefix + "/schemas", latched,
+      [&](const data_tamer_msgs::msg::Schemas& msg) { received.push_back(msg); });
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  bool first_seen = false;
+  while(std::chrono::steady_clock::now() < deadline)
+  {
+    executor.spin_some(std::chrono::milliseconds(20));
+    if(!first_seen && !received.empty())
+    {
+      first_seen = true;
+      deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    }
+  }
+  return received;
+}
+
+std::set<uint64_t> hashesOf(const data_tamer_msgs::msg::Schemas& msg)
+{
+  std::set<uint64_t> hashes;
+  for(const auto& schema : msg.schemas)
+  {
+    hashes.insert(schema.hash);
+    EXPECT_FALSE(schema.schema_text.empty());
+  }
+  return hashes;
+}
+}  // namespace
+
 TEST(DataTamerROS2Publisher, SchemasPublishedOnPrepareForLateJoiners)
 {
   auto node = std::make_shared<rclcpp::Node>("test_datatamer_schemas_late");
   auto ros2_sink = ROS2PublisherSink::create(node, "test_schemas_late");
 
-  // two channels, prepared without taking any snapshot
+  // two channels, prepared without taking any snapshot: two catalogs published
   auto channel_a = LogChannel::create("channel_schemas_late_a");
   auto channel_b = LogChannel::create("channel_schemas_late_b");
   double const value = 1.;
@@ -363,35 +408,28 @@ TEST(DataTamerROS2Publisher, SchemasPublishedOnPrepareForLateJoiners)
   channel_a->prepare();
   channel_b->prepare();
 
-  // subscribe afterwards: transient-local depth 1 delivers only the latest
-  // message, which must be the complete catalog
-  rclcpp::QoS latched{ rclcpp::KeepLast(1) };
-  latched.reliable();
-  latched.transient_local();
-  std::vector<data_tamer_msgs::msg::Schemas> received;
-  auto sub = node->create_subscription<data_tamer_msgs::msg::Schemas>(
-      "test_schemas_late/schemas", latched,
-      [&](const data_tamer_msgs::msg::Schemas& msg) { received.push_back(msg); });
-
-  rclcpp::executors::SingleThreadedExecutor executor;
-  executor.add_node(node);
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  while(received.empty() && std::chrono::steady_clock::now() < deadline)
-  {
-    executor.spin_some(std::chrono::milliseconds(100));
-  }
-  // give a (wrong) second retained message the chance to arrive
-  executor.spin_some(std::chrono::milliseconds(200));
-
+  // the writer keeps only the latest one, which is the complete catalog
+  const auto received = receiveRetainedSchemas(node, "test_schemas_late");
   ASSERT_EQ(received.size(), 1u);
-  std::set<uint64_t> hashes;
-  for(const auto& schema : received[0].schemas)
-  {
-    hashes.insert(schema.hash);
-    EXPECT_FALSE(schema.schema_text.empty());
-  }
-  EXPECT_EQ(hashes, (std::set<uint64_t>{ channel_a->getSchema().hash,
-                                         channel_b->getSchema().hash }));
+  EXPECT_EQ(hashesOf(received[0]), (std::set<uint64_t>{ channel_a->getSchema().hash,
+                                                        channel_b->getSchema().hash }));
+}
+
+TEST(DataTamerROS2Publisher, SchemasPublishedOnAddDataSinkToPreparedChannel)
+{
+  auto node = std::make_shared<rclcpp::Node>("test_datatamer_schemas_add_sink");
+  auto ros2_sink = ROS2PublisherSink::create(node, "test_schemas_add_sink");
+
+  auto channel = LogChannel::create("channel_schemas_add_sink");
+  double const value = 1.;
+  channel->registerValue("value", &value);
+  channel->addDataSink(DummySink::create());
+  channel->prepare();
+  channel->addDataSink(ros2_sink);  // announced now; no snapshot is taken
+
+  const auto received = receiveRetainedSchemas(node, "test_schemas_add_sink");
+  ASSERT_EQ(received.size(), 1u);
+  EXPECT_EQ(hashesOf(received[0]), (std::set<uint64_t>{ channel->getSchema().hash }));
 }
 
 TEST(DataTamerROS2Publisher, QoS)
