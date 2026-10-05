@@ -72,10 +72,15 @@ target_include_directories(data_tamer
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/3rdparty>
 )
 target_compile_definitions(data_tamer PUBLIC DATA_TAMER_VERSION="${PROJECT_VERSION}")
-target_link_libraries(data_tamer
-    PUBLIC Threads::Threads
-    PRIVATE ${DATA_TAMER_MCAP_TARGET}
-)
+target_link_libraries(data_tamer PUBLIC Threads::Threads)
+if(DATA_TAMER_BUILD_ROS)
+    target_link_libraries(data_tamer PRIVATE ${DATA_TAMER_MCAP_TARGET})
+else()
+    # PUBLIC: sinks/mcap_encoding.hpp includes the MCAP headers. libdata_tamer
+    # compiles the MCAP implementation itself (mcap_sink.cpp), so consumers get
+    # the headers of the exact MCAP version it was built with.
+    target_link_libraries(data_tamer PUBLIC ${DATA_TAMER_MCAP_TARGET})
+endif()
 
 set(INSTALL_TARGETS data_tamer)
 

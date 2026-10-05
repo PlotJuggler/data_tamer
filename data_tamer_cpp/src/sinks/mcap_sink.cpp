@@ -1,6 +1,8 @@
 #include "data_tamer/sinks/mcap_sink.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -25,13 +27,34 @@ std::string NumberedPath(const std::string& path, size_t number)
   const size_t name_begin = (slash == std::string::npos) ? 0 : slash + 1;
   // Skip the leading dots of a hidden file (".foo"): they are not an extension.
   const size_t stem_begin = path.find_first_not_of('.', name_begin);
-  const size_t dot =
-      (stem_begin == std::string::npos) ? std::string::npos : path.find('.', stem_begin);
-  if(dot == std::string::npos)
+  if(stem_begin == std::string::npos)
   {
     return path + suffix;
   }
-  return path.substr(0, dot) + suffix + path.substr(dot);
+  // The extension is the trailing run of purely alphabetic dot-segments
+  // (".tamer.mcap"); "1.2" or "v2" belong to the stem.
+  const auto alphabetic = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+  };
+  size_t extension_begin = path.size();
+  size_t segment_end = path.size();
+  while(true)
+  {
+    const size_t dot = path.rfind('.', segment_end - 1);
+    if(dot == std::string::npos || dot <= stem_begin)
+    {
+      break;
+    }
+    const auto first = path.begin() + static_cast<std::ptrdiff_t>(dot + 1);
+    const auto last = path.begin() + static_cast<std::ptrdiff_t>(segment_end);
+    if(first == last || !std::all_of(first, last, alphabetic))
+    {
+      break;
+    }
+    extension_begin = dot;
+    segment_end = dot;
+  }
+  return path.substr(0, extension_begin) + suffix + path.substr(extension_begin);
 }
 }  // namespace details
 
@@ -57,7 +80,7 @@ struct MCAPSink::Pimpl
   std::chrono::seconds reset_time = std::chrono::seconds(60 * 10);
   std::chrono::system_clock::time_point start_time;
 
-  std::vector<uint8_t> message_body;  // reused, see mcap_encoding::writeMessage
+  std::vector<uint8_t> message_body;  // reused, see mcap_encoding::WriteMessage
   bool forced_stop_recording = false;
   std::recursive_mutex mutex;
 };
@@ -68,23 +91,25 @@ MCAPSink::MCAPSink(const std::string& filepath, bool do_compression)
   _p->filepath = filepath;
   _p->compression = do_compression;
   _p->original_filepath = filepath;
-  openFile(_p->filepath);
+  openFile(_p->filepath, do_compression);
 }
 
-void DataTamer::MCAPSink::openFile(std::string const& filepath)
+void DataTamer::MCAPSink::openFile(std::string const& filepath, bool do_compression)
 {
   std::scoped_lock lk(_p->mutex);
   // Open the new file first: if that fails the current recording stays intact.
   auto writer = std::make_unique<mcap::McapWriter>();
   mcap::McapWriterOptions options(mcap_encoding::kEncoding);
   options.compression =
-      _p->compression ? mcap::Compression::Zstd : mcap::Compression::None;
+      do_compression ? mcap::Compression::Zstd : mcap::Compression::None;
   const auto status = writer->open(filepath, options);
   if(!status.ok())
   {
     throw std::runtime_error("Failed to open MCAP file for writing: " + status.message);
   }
   _p->writer = std::move(writer);  // closes the previous file
+  _p->filepath = filepath;
+  _p->compression = do_compression;
   _p->start_time = std::chrono::system_clock::now();
   _p->hash_to_channel.clear();
 }
@@ -101,7 +126,7 @@ void MCAPSink::onSchema(Schema const& schema)
     return;
   }
 
-  _p->hash_to_channel[schema.hash].id = mcap_encoding::addChannel(*_p->writer, schema);
+  _p->hash_to_channel[schema.hash].id = mcap_encoding::AddChannel(*_p->writer, schema);
 }
 
 void MCAPSink::onSnapshot(const SnapshotRef& ref)
@@ -113,7 +138,7 @@ void MCAPSink::onSnapshot(const SnapshotRef& ref)
   }
   const Snapshot& snapshot = *ref;
   auto& channel = _p->hash_to_channel.at(snapshot.schema_hash);
-  const auto status = mcap_encoding::writeSnapshot(
+  const auto status = mcap_encoding::WriteSnapshot(
       *_p->writer, channel.id, channel.next_sequence++, snapshot, _p->message_body);
   if(!status.ok())
   {
@@ -127,11 +152,22 @@ void MCAPSink::onSnapshot(const SnapshotRef& ref)
   {
     if(_p->create_file_on_reset)
     {
-      // change the current filepath to the original with "_[# resets]"" appended
-      _p->filepath = details::NumberedPath(_p->original_filepath, _p->file_reset_counter);
-      ++_p->file_reset_counter;
+      // The original path with "_<n>" inserted. Skip the names that exist
+      // already (e.g. from a previous run): opening a file truncates it.
+      size_t counter = _p->file_reset_counter;
+      std::string next;
+      std::error_code ec;
+      do
+      {
+        next = details::NumberedPath(_p->original_filepath, counter++);
+      } while(std::filesystem::exists(next, ec));
+      restartRecordingImpl(next, _p->compression, false);
+      _p->file_reset_counter = counter;  // only once the file is open
     }
-    restartRecordingImpl(_p->filepath, _p->compression, false);
+    else
+    {
+      restartRecordingImpl(_p->filepath, _p->compression, false);
+    }
   }
 }
 
@@ -167,15 +203,13 @@ void MCAPSink::restartRecordingImpl(const std::string& filepath, bool do_compres
                                     bool new_file)
 {
   std::scoped_lock lk(_p->mutex);
+  openFile(filepath, do_compression);  // throws: the current recording is kept
   if(new_file)
   {
     // if this was called by a user, we need to change the filepath that we will increment when reset
     _p->file_reset_counter = 1;
     _p->original_filepath = filepath;
   }
-  _p->filepath = filepath;
-  _p->compression = do_compression;
-  openFile(_p->filepath);
 
   // rebuild the channels
   for(auto const& [hash, schema] : _p->schemas)

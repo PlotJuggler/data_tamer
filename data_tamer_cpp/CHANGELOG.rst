@@ -19,20 +19,27 @@ Unreleased
 * **Breaking, MCAP rollover** (#98): when ``setMaxTimeBeforeReset`` expires
   (600 s by default), ``MCAPSink`` now continues in a new numbered file instead
   of truncating the current one, so nothing recorded is discarded. Truncation is
-  opt-in with ``setCreateNewFileOnReset(false)``. The counter is inserted before
-  the first dot of the file name, so multi-part extensions survive:
-  ``run.tamer.mcap`` rolls over to ``run_1.tamer.mcap`` (it was
-  ``run.tamer_1.mcap``).
+  opt-in with ``setCreateNewFileOnReset(false)``. Numbered names that already
+  exist (e.g. from a previous run with the same path) are skipped instead of
+  overwritten. The counter is inserted before the extension, now the trailing
+  run of alphabetic dot-segments, so multi-part extensions survive and dotted
+  stems stay whole: ``run.tamer.mcap`` rolls over to ``run_1.tamer.mcap`` (it
+  was ``run.tamer_1.mcap``), ``log_2026.10.05.mcap`` to
+  ``log_2026.10.05_1.mcap``.
 * MCAP messages carry a per-channel ``sequence`` number (1, 2, 3, ... per MCAP
   channel and file) instead of always 1, so readers can detect gaps (#98).
-* New ``data_tamer/sinks/mcap_encoding.hpp`` (#96): header-only helpers
-  ``mcap_encoding::addChannel()``, ``writeSnapshot()`` (for a ``Snapshot``),
-  ``writeMessage()`` (from a timestamp and mask and payload spans, e.g.
-  for stored data) and ``encodeMessageBody()`` that write the MCAP records of
+* New ``data_tamer/sinks/mcap_encoding.hpp`` (#96): inline helpers
+  ``mcap_encoding::AddChannel()``, ``WriteSnapshot()`` (for a ``Snapshot``),
+  ``WriteMessage()`` (from a timestamp and mask and payload spans, e.g.
+  for stored data) and ``EncodeMessageBody()`` that write the MCAP records of
   ``docs/wire_format.md``. ``MCAPSink`` uses them. The caller provides the
   sequence number and a reusable scratch buffer (no allocation once it is large
-  enough). The ``DataSink`` documentation now explains that a slow
-  ``onSnapshot()`` exhausts the channel's shared snapshot pool for every sink.
+  enough). They need ``data_tamer::data_tamer`` (and ``mcap_vendor::mcap`` under
+  ROS 2); outside ROS 2 the bundled MCAP headers are now installed and exported
+  with data_tamer, whose library already contains the MCAP implementation (do not
+  define ``MCAP_IMPLEMENTATION``). ``SerializeMe::Span<const T>`` converts from a
+  ``const std::vector<T>&``. The ``DataSink`` documentation now explains that a
+  slow ``onSnapshot()`` exhausts the channel's shared snapshot pool for every sink.
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /

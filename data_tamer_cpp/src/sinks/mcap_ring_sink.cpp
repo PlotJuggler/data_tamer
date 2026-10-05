@@ -317,10 +317,10 @@ void MCAPRingSink::Pimpl::writeDump(MCAPRingDump& dump)
         }
         it = channels
                  .emplace(header.schema_hash,
-                          Channel{ mcap_encoding::addChannel(writer, *schema), 1 })
+                          Channel{ mcap_encoding::AddChannel(writer, *schema), 1 })
                  .first;
       }
-      status = mcap_encoding::writeMessage(
+      status = mcap_encoding::WriteMessage(
           writer, it->second.id, it->second.next_sequence++, timestamp,
           { mask, header.mask_size }, { payload, header.payload_size }, scratch);
       if(!status.ok())

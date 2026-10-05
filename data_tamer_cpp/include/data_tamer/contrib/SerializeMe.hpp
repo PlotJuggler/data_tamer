@@ -51,6 +51,11 @@ public:
 
   Span(std::vector<T>& v) : data_(v.data()), size_(v.size()) {}
 
+  /// Read-only view of a vector: Span<const uint8_t> from a (const) std::vector<uint8_t>.
+  template <typename U, std::enable_if_t<std::is_same_v<const U, T>, int> = 0>
+  Span(const std::vector<U>& v) : data_(v.data()), size_(v.size())
+  {}
+
   T const* data() const;
 
   T* data();
