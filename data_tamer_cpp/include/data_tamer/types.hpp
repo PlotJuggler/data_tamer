@@ -188,6 +188,21 @@ std::string ToStr(const Schema& schema);
  */
 std::string ToYaml(const Schema& schema);
 
+/// Text rendering of a schema. Both carry the same Schema::hash and are read by
+/// the parsers, which detect the format.
+enum class SchemaFormat
+{
+  /// ToStr(): the line format, schema version 5. Every reader understands it.
+  Text,
+  /// ToYaml(): schema version 6 (docs/wire_format.md, section 2.1). Shorter when
+  /// field names are "/"-separated paths; readers that predate it (e.g. older
+  /// PlotJuggler releases) cannot read it.
+  Yaml,
+};
+
+/// ToStr(schema) or ToYaml(schema), depending on `format`.
+std::string RenderSchema(const Schema& schema, SchemaFormat format);
+
 /**
  * @brief Hash of a schema text (see docs/wire_format.md, section 5): FNV-1a 64 over
  * the text with its "### hash:" line removed. Defined byte for byte, so any decoder
