@@ -4,9 +4,11 @@
 #include "data_tamer_msgs/msg/snapshot_batch.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace DataTamer
 {
@@ -51,6 +53,9 @@ struct ROS2PublisherSink::Pimpl
   // batch_msg.snapshots. Elements are reused across batches, so that copying a
   // snapshot into them does not allocate once their buffers have grown.
   size_t batch_count = 0;
+  // Elements past batch_count, set aside while a batch closed early (flush(),
+  // max_batch_delay) is published, so that their buffers are not freed.
+  std::vector<data_tamer_msgs::msg::Snapshot> spare_snapshots;
   std::chrono::steady_clock::time_point batch_start;
 
   PublisherNodeInterfaces node_interface;
@@ -95,7 +100,9 @@ void ROS2PublisherSink::create_publishers(const std::string& topic_prefix)
   {
     _p->batch_publisher = rclcpp::create_publisher<data_tamer_msgs::msg::SnapshotBatch>(
         _p->node_interface, topic_prefix + "/data_batch", data_qos);
-    _p->batch_msg.snapshots.reserve(std::min<size_t>(_p->options.max_batch_size, 1024));
+    const size_t reserved = std::min<size_t>(_p->options.max_batch_size, 1024);
+    _p->batch_msg.snapshots.reserve(reserved);
+    _p->spare_snapshots.reserve(reserved);
   }
   else
   {
@@ -206,10 +213,18 @@ void ROS2PublisherSink::Pimpl::publishBatch()
     {
       p.batch_count = 0;
       p.batch_msg.schemas.clear();
+      for(auto& spare : p.spare_snapshots)
+      {
+        p.batch_msg.snapshots.push_back(std::move(spare));
+      }
+      p.spare_snapshots.clear();
     }
   } clear{ *this };
-  // Only a partial batch (flush) has spare elements to drop before publishing.
-  batch_msg.snapshots.resize(batch_count);
+  auto& snapshots = batch_msg.snapshots;
+  const auto unused = snapshots.begin() + static_cast<std::ptrdiff_t>(batch_count);
+  spare_snapshots.assign(std::make_move_iterator(unused),
+                         std::make_move_iterator(snapshots.end()));
+  snapshots.erase(unused, snapshots.end());
   batch_publisher->publish(batch_msg);
 }
 

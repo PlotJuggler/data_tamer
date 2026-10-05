@@ -181,6 +181,7 @@ class YamlSchema(unittest.TestCase):
                     head + 'fields:\n  "\\x+1": int8\n',            # bad hex escape
                     head + 'fields:\n  "\\uD800": int8\n',          # surrogate
                     "version: +6\nhash: 1\nchannel_name: c\nfields: {}\n",
+                    "version: 6\nhash: 18446744073709551616\nchannel_name: c\nfields: {}\n",
                     "  version: 6\n  hash: 1\n  channel_name: c\n  fields: {}\n",
                     head + "fields:\n" + "".join("  " * (i + 1) + "k:\n" for i in range(100))
                     + "  " * 101 + "x: int8\n"]:                      # too deep

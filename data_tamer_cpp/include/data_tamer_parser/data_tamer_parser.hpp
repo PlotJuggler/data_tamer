@@ -81,9 +81,6 @@ struct TypeField
 
 using FieldsVector = std::vector<TypeField>;
 
-/**
- * @brief DataTamer uses a simple "flat" schema of key/value pairs (each pair is a "field").
- */
 /// A custom type whose layout is described in a foreign schema language.
 struct CustomSchema
 {
@@ -91,6 +88,9 @@ struct CustomSchema
   std::string schema;
 };
 
+/**
+ * @brief DataTamer uses a simple "flat" schema of key/value pairs (each pair is a "field").
+ */
 struct Schema
 {
   uint64_t hash = 0;
