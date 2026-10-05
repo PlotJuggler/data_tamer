@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -533,6 +534,60 @@ inline std::pair<std::string, std::string> SplitYamlEntry(const std::string& con
   return { key, rest };
 }
 
+/// Type names of the schema text, indexed by BasicType.
+inline const std::array<std::string, TypesCount>& BasicTypeNames()
+{
+  static const std::array<std::string, TypesCount> kNames = {
+    "bool",   "char",  "int8",   "uint8",   "int16",   "uint16", "int32",
+    "uint32", "int64", "uint64", "float32", "float64", "other"
+  };
+  return kNames;
+}
+
+/// BasicType named exactly `name`; OTHER for anything else (custom types).
+inline BasicType BasicTypeFromName(const std::string& name)
+{
+  const auto& names = BasicTypeNames();
+  for(size_t i = 0; i + 1 < TypesCount; i++)
+  {
+    if(name == names[i])
+    {
+      return static_cast<BasicType>(i);
+    }
+  }
+  return BasicType::OTHER;
+}
+
+/// Strict unsigned decimal: digits only, no sign or spaces. nullopt if invalid
+/// or if it does not fit in 64 bits.
+inline std::optional<uint64_t> ParseUnsigned(const std::string& value)
+{
+  if(value.empty() || value.size() > 20 ||
+     value.find_first_not_of("0123456789") != std::string::npos)
+  {
+    return std::nullopt;
+  }
+  try
+  {
+    return std::stoull(value);
+  }
+  catch(const std::out_of_range&)
+  {
+    return std::nullopt;
+  }
+}
+
+/// The N of a fixed-size array "[N]" (digits only). nullopt unless it is in 1..65535.
+inline std::optional<uint16_t> ParseArrayExtent(const std::string& digits)
+{
+  const auto extent = ParseUnsigned(digits);
+  if(!extent || *extent == 0 || *extent > 65535)
+  {
+    return std::nullopt;
+  }
+  return static_cast<uint16_t>(*extent);
+}
+
 /// Parses the block-mapping subset of YAML written by DataTamer::ToYaml().
 inline std::vector<YamlNode> ParseYamlTree(const std::string& txt)
 {
@@ -541,9 +596,10 @@ inline std::vector<YamlNode> ParseYamlTree(const std::string& txt)
     int parent_indent;
     std::optional<int> indent;  // indentation of this mapping's entries
     std::vector<YamlNode>* entries;
+    std::unordered_set<std::string> keys;
   };
   std::vector<YamlNode> root;
-  std::vector<Level> stack = { { -1, 0, &root } };  // top level starts at column 0
+  std::vector<Level> stack = { { -1, 0, &root, {} } };  // top level starts at column 0
 
   std::istringstream ss(txt);
   std::string line;
@@ -577,12 +633,9 @@ inline std::vector<YamlNode> ParseYamlTree(const std::string& txt)
       YamlError("bad indentation", line);
     }
     auto [key, rest] = SplitYamlEntry(line.substr(first), line);
-    for(const auto& sibling : *level.entries)
+    if(!level.keys.insert(key).second)
     {
-      if(sibling.key == key)
-      {
-        YamlError("duplicate key", line);
-      }
+      YamlError("duplicate key", line);
     }
     YamlNode node;
     node.key = std::move(key);
@@ -597,7 +650,7 @@ inline std::vector<YamlNode> ParseYamlTree(const std::string& txt)
       {
         YamlError("nesting too deep", line);
       }
-      stack.push_back({ indent, std::nullopt, &level.entries->back().children });
+      stack.push_back({ indent, std::nullopt, &level.entries->back().children, {} });
     }
   }
   return root;
@@ -605,10 +658,6 @@ inline std::vector<YamlNode> ParseYamlTree(const std::string& txt)
 
 inline TypeField ParseYamlTypeSpec(const std::string& spec)
 {
-  static const std::array<std::string, TypesCount> kNames = {
-    "bool",   "char",  "int8",   "uint8",   "int16",   "uint16", "int32",
-    "uint32", "int64", "uint64", "float32", "float64", "other"
-  };
   TypeField field;
   const auto bracket = spec.find('[');
   field.type_name = spec.substr(0, bracket);
@@ -616,13 +665,7 @@ inline TypeField ParseYamlTypeSpec(const std::string& spec)
   {
     throw std::runtime_error("DataTamerParser: YAML schema: empty type");
   }
-  for(size_t i = 0; i + 1 < TypesCount; i++)
-  {
-    if(field.type_name == kNames[i])
-    {
-      field.type = static_cast<BasicType>(i);
-    }
-  }
+  field.type = BasicTypeFromName(field.type_name);
   if(bracket != std::string::npos)
   {
     field.is_vector = true;
@@ -633,14 +676,14 @@ inline TypeField ParseYamlTypeSpec(const std::string& spec)
     }
     if(!inner.empty())
     {
-      const unsigned long long extent = inner.size() > 5 ? 0 : std::stoull(inner);
-      if(extent == 0 || extent > 65535)
+      const auto extent = ParseArrayExtent(inner);
+      if(!extent)
       {
         throw std::runtime_error("DataTamerParser: YAML schema: array size out of "
                                  "range (1..65535) in " +
                                  spec);
       }
-      field.array_size = static_cast<uint16_t>(extent);
+      field.array_size = *extent;
     }
   }
   return field;
@@ -706,21 +749,13 @@ inline Schema BuildSchemaFromYaml(const std::string& txt, bool check_hash = fals
     return node ? &node->children : nullptr;
   };
   auto toUint = [](const std::string& value, const char* what) {
-    if(value.empty() || value.size() > 20 ||
-       value.find_first_not_of("0123456789") != std::string::npos)
+    const auto parsed = detail::ParseUnsigned(value);
+    if(!parsed)
     {
       throw std::runtime_error(std::string("DataTamerParser: YAML schema: invalid ") +
                                what);
     }
-    try
-    {
-      return std::stoull(value);
-    }
-    catch(const std::out_of_range&)
-    {
-      throw std::runtime_error(std::string("DataTamerParser: YAML schema: invalid ") +
-                               what);
-    }
+    return *parsed;
   };
 
   if(toUint(scalar("version"), "version") != SCHEMA_YAML_VERSION)
@@ -876,10 +911,7 @@ inline Schema BuildSchemaFromText(const std::string& txt, bool check_hash = fals
 
     TypeField field;
 
-    static const std::array<std::string, TypesCount> kNamesNew = {
-      "bool",   "char",  "int8",   "uint8",   "int16",   "uint16", "int32",
-      "uint32", "int64", "uint64", "float32", "float64", "other"
-    };
+    const auto& kNamesNew = detail::BasicTypeNames();
     // backcompatibility to old format
     static const std::array<std::string, TypesCount> kNamesOld = {
       "BOOL",   "CHAR",  "INT8",   "UINT8", "INT16",  "UINT16", "INT32",
@@ -932,12 +964,12 @@ inline Schema BuildSchemaFromText(const std::string& txt, bool check_hash = fals
         {
           throw std::runtime_error("Invalid array size in: " + line);
         }
-        const unsigned long long extent = std::stoull(number_string);
-        if(extent == 0 || extent > 65535)
+        const auto extent = detail::ParseArrayExtent(number_string);
+        if(!extent)
         {
           throw std::runtime_error("Array size out of range (1..65535) in: " + line);
         }
-        field.array_size = static_cast<uint16_t>(extent);
+        field.array_size = *extent;
       }
     }
 
