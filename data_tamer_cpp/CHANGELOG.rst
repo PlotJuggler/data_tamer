@@ -4,6 +4,47 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* ROS 2: export the ``Threads`` dependency, so that ``find_package(data_tamer_cpp)``
+  works from a fresh CMake cache (``Threads::Threads`` is in the public link
+  interface).
+* ``ROS2PublisherSink`` can aggregate snapshots: pass ``ROS2PublisherOptions``
+  with ``aggregate = true`` to publish ``data_tamer_msgs/SnapshotBatch`` on
+  ``<prefix>/data_batch`` instead of one ``Snapshot`` per sample on
+  ``<prefix>/data``. A batch is sent when it reaches ``max_batch_size``
+  snapshots, when a snapshot arrives ``max_batch_delay`` after the first one of
+  the batch, on ``flush()`` and when the sink is destroyed. ``embed_schemas``
+  (default on) puts the schemas of the batch's snapshots in the message, so it
+  decodes without the ``schemas`` topic. Schema texts are now serialized once,
+  in ``onSchema()``, instead of on every republish.
+* Parser helpers to decode the ROS messages without depending on ROS (templates
+  on the message type): ``DataTamerParser::SchemaRegistry`` (schemas by hash,
+  filled from ``Schemas`` or embedded batch schemas), ``ToSnapshotView()`` and
+  ``ForEachSnapshotInBatch()``. Python equivalents in ``data_tamer_parser.py``:
+  ``SchemaRegistry``, ``parse_snapshot_msg()`` and ``iter_snapshot_batch()``.
+* YAML schema rendering (wire format version 6, section 2.1): ``ToYaml(schema)``
+  writes the same schema as YAML, nesting fields whose names share a
+  ``/``-separated prefix, which is shorter for path-like names (the hash is
+  unchanged). ``RenderSchema(schema, SchemaFormat)`` picks either rendering;
+  opt in for ROS with ``ROS2PublisherOptions::schema_format =
+  SchemaFormat::Yaml``.
+  ``BuildSchemaFromText()`` and the Python ``parse_schema()`` detect and read
+  both renderings without dependencies, and verify a YAML schema's hash via
+  ``ToText()`` / ``to_text()``. The parser's ``Schema`` gains
+  ``custom_schemas`` (opaque types, filled from YAML).
+* Examples: ``ros2_publisher`` takes ``--aggregate`` and ``--yaml``;
+  ``python/ros2_subscriber.py`` decodes ``Snapshot`` and ``SnapshotBatch``
+  topics with the Python decoder.
+* The Python decoder is a package, ``data-tamer-parser`` (``python/pyproject.toml``,
+  still standard library only, importable as ``data_tamer_parser``; version
+  ``data_tamer_parser.__version__``): ``pip install ./python``. The ``python``
+  workflow tests and builds it and publishes it to PyPI on ``X.Y.Z`` tags; it
+  is versioned in lockstep with the library (release tag == ``package.xml``
+  version == ``data_tamer_parser.__version__``). New
+  ``Schema.field_names()`` lists the flattened names from the schema alone
+  (dynamic vector elements as the placeholder ``vec[]``; bounded by
+  ``MAX_SCHEMA_DEPTH`` and ``MAX_FIELD_NAMES``), and ``iter_mcap(path)`` yields
+  ``(timestamp, topic, values)`` for an MCAP file, with the optional ``mcap``
+  package (``data-tamer-parser[mcap]``).
 * New customization point ``DataTamer::TypeDefinitionTrait<T, Enable = void>``
   (#94): describe a type with a ``static define(T&, AddField&)`` specialization
   instead of a ``TypeDefinition`` overload in the type's own namespace, so
