@@ -47,6 +47,13 @@ struct is_tagged<T, std::void_t<typename T::is_tagged>> : T::is_tagged
 {
 };
 
+// class template whose trait define() returns an owning std::string
+template <int N>
+struct Mat
+{
+  std::array<double, N * N> data{};
+};
+
 // A type that has BOTH an ADL overload and a trait specialization.
 struct Both
 {
@@ -102,6 +109,31 @@ struct TypeDefinitionTrait<T, std::enable_if_t<third_party::is_tagged<T>::value>
   }
 };
 
+// define() returning a std::string built at runtime: the name is cached by
+// the library (returning it as a string_view would otherwise dangle).
+template <int N>
+struct TypeDefinitionTrait<third_party::Mat<N>>
+{
+  template <class AddField>
+  static std::string define(third_party::Mat<N>& m, AddField& add)
+  {
+    add("data", &m.data);
+    return "Mat" + std::to_string(N) + "x" + std::to_string(N);
+  }
+};
+
+// A specialization whose define() can not be called with a generic AddField
+// is a compile error, not silently ignored (it would otherwise fall back to an
+// ADL TypeDefinition). For example, this fails to compile on first use:
+//
+//   template <>
+//   struct TypeDefinitionTrait<third_party::Point>
+//   {
+//     static std::string_view define(third_party::Point&, int&);
+//   };
+//   // error: "DataTamer::TypeDefinitionTrait<T> is specialized, but it has no
+//   //         static define(T&, AddField&) callable with a generic AddField"
+
 // the trait wins over the ADL overload
 template <>
 struct TypeDefinitionTrait<third_party::Both>
@@ -134,6 +166,9 @@ static_assert(has_TypeDefinition<third_party::Polyline>::value);
 static_assert(has_TypeDefinitionTrait<third_party::Both>::value);
 static_assert(has_TypeDefinitionADL<third_party::Both>::value);
 static_assert(!has_TypeDefinition<NotDescribed>::value);
+static_assert(!SerializeMe::is_TypeDefinitionTrait_specialized<NotDescribed>::value);
+static_assert(
+    SerializeMe::is_TypeDefinitionTrait_specialized<third_party::Mat<2>>::value);
 static_assert(!has_TypeDefinition<std::vector<third_party::Point>>::value);
 static_assert(!has_TypeDefinition<std::array<third_party::Vec<2>, 2>>::value);
 
@@ -170,6 +205,12 @@ TEST(TypeDefinitionTrait, TypeNames)
   EXPECT_EQ(CustomTypeName<third_party::Vec<2>>::get().data(),
             CustomTypeName<third_party::Vec<2>>::get().data());
   EXPECT_EQ(CustomTypeName<third_party::Polyline>::get(), "Polyline");
+  // define() returns std::string: the view must stay valid
+  const std::string_view mat3 = CustomTypeName<third_party::Mat<3>>::get();
+  const std::string_view mat2 = CustomTypeName<third_party::Mat<2>>::get();
+  EXPECT_EQ(mat3, "Mat3x3");
+  EXPECT_EQ(mat2, "Mat2x2");
+  EXPECT_EQ(mat3.data(), CustomTypeName<third_party::Mat<3>>::get().data());
   EXPECT_EQ(CustomTypeName<third_party::Both>::get(), "BothTrait");
 }
 
@@ -258,4 +299,35 @@ TEST(TypeDefinitionTrait, RegisterAndSnapshot)
                             "int32 b\n"),
             std::string::npos);
   EXPECT_EQ(schema_txt.find("BothADL"), std::string::npos);
+}
+
+TEST(TypeDefinitionTrait, DefineReturningStdString)
+{
+  auto channel = LogChannel::create("chan");
+  DataTamerTest::Attached<DataTamer::DummySink> sink;
+  channel->addDataSink(sink);
+
+  third_party::Mat<2> mat;
+  mat.data = { 1, 2, 3, 4 };
+  std::vector<third_party::Mat<3>> mats(1);
+  channel->registerValue("mat", &mat);
+  channel->registerValue("mats", &mats);
+
+  ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+  sink.drain();
+  EXPECT_EQ(sink->latestPayloadSize(),
+            4 * sizeof(double) + sizeof(uint32_t) + 9 * sizeof(double));
+
+  const auto schema = channel->getSchema();
+  const std::string schema_txt = ToStr(schema);
+  EXPECT_EQ(schema.custom_types.count("Mat2x2"), 1u);
+  EXPECT_EQ(schema.custom_types.count("Mat3x3"), 1u);
+  EXPECT_NE(schema_txt.find("Mat2x2 mat\n"
+                            "Mat3x3[] mats\n"),
+            std::string::npos)
+      << schema_txt;
+  EXPECT_NE(schema_txt.find("MSG: Mat3x3\n"
+                            "float64[9] data\n"),
+            std::string::npos)
+      << schema_txt;
 }

@@ -242,7 +242,10 @@ struct DataTamer::TypeDefinitionTrait<third_party::Point>
 Partial specializations work too; the second, defaulted template parameter
 accepts `std::enable_if_t<...>` / `std::void_t<...>`. For class templates the
 name can be built at runtime with an optional `static std::string name()`: it
-is evaluated once per type, and `define()` may then return `void`.
+is evaluated once per type (per shared library, like any function-local
+static), and `define()` may then return `void`. A `define()` that returns a
+`std::string` is cached the same way; a `std::string_view` or `const char*`
+must point to storage that outlives the program, such as a string literal.
 
 ```cpp
 template <typename T, int N>
@@ -265,7 +268,9 @@ struct DataTamer::TypeDefinitionTrait<Eigen::Matrix<T, N, 1>>
 
 The specialization must be visible wherever the type is registered. If a type
 has both a `TypeDefinitionTrait` specialization and a `TypeDefinition` overload,
-the trait is used.
+the trait is used. A specialization whose `define()` can not be called as
+`define(T&, AddField&)` with a generic `AddField` is a compile error rather
+than being ignored.
 
 # Compilation
 

@@ -75,9 +75,12 @@ private:
 //------------------------------------------------------------------
 
 // Name of a custom type, as written in the schema.
-// It comes from DataTamer::TypeDefinitionTrait<T>::name() when provided
-// (built once at runtime and cached for the lifetime of the process),
-// otherwise from the string_view returned by the definition of T.
+// It comes from DataTamer::TypeDefinitionTrait<T>::name() when provided,
+// otherwise from the value returned by the definition of T.
+// A definition returning std::string_view or const char* must point to
+// storage that outlives the program (e.g. a string literal). If it returns
+// an owning string (e.g. std::string), it is evaluated once and the result is
+// cached, like name().
 template <typename T>
 struct CustomTypeName
 {
@@ -93,13 +96,27 @@ struct CustomTypeName
     else
     {
       static_assert(std::is_default_constructible_v<T>, "Must be default constructible");
-      using Result = decltype(SerializeMe::InvokeTypeDefinition(
-          std::declval<T&>(), std::declval<SerializeMe::EmptyFunc&>()));
-      // Otherwise define() must return the name of the type
-      constexpr bool returns_name = std::is_convertible_v<Result, std::string_view>;
-      static_assert(returns_name, "TypeDefinition must return the type name");
-      T dummy;
-      return SerializeMe::InvokeTypeDefinition(dummy, SerializeMe::EmptyFuncion);
+      using Result = std::decay_t<decltype(SerializeMe::InvokeTypeDefinition(
+          std::declval<T&>(), std::declval<SerializeMe::EmptyFunc&>()))>;
+      if constexpr(std::is_same_v<Result, std::string_view> ||
+                   std::is_same_v<Result, const char*>)
+      {
+        T dummy;
+        return SerializeMe::InvokeTypeDefinition(dummy, SerializeMe::EmptyFuncion);
+      }
+      else
+      {
+        // An owning result would dangle once returned as a view: keep it.
+        static_assert(std::is_constructible_v<std::string, Result>, "TypeDefinition must "
+                                                                    "return the type "
+                                                                    "name");
+        static const std::string name = []() {
+          T dummy;
+          return std::string(
+              SerializeMe::InvokeTypeDefinition(dummy, SerializeMe::EmptyFuncion));
+        }();
+        return name;
+      }
     }
   }
 };

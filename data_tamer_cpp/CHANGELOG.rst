@@ -10,8 +10,10 @@ Unreleased
   third-party types (Eigen, ...) no longer require reopening their namespace.
   Partial specializations (including ``enable_if`` on the second parameter) are
   supported. An optional ``static std::string name()`` builds the type name at
-  runtime (once per type), e.g. for class templates. When both a trait and an
-  ADL ``TypeDefinition`` exist, the trait wins. Existing ``TypeDefinition``
+  runtime (once per type, per shared library), e.g. for class templates; a
+  ``define()`` returning ``std::string`` is cached the same way. When both a
+  trait and an ADL ``TypeDefinition`` exist, the trait wins; a specialization
+  with an unusable ``define()`` is a compile error. Existing ``TypeDefinition``
   overloads keep working. ``CustomTypeName<T>::get()`` is no longer
   ``constexpr``. ``SerializeMe::DeserializeFromBuffer`` now compiles for custom
   types (it passed const field pointers and could not write the fields).

@@ -102,12 +102,18 @@ namespace DataTamer
  *   static std::string name();
  *
  * to build the type name at runtime (useful for class templates, e.g.
- * "Vector" + std::to_string(N)). It is evaluated once per type and cached;
+ * "Vector" + std::to_string(N)). It is evaluated once per type (per shared
+ * library, as for any function-local static) and cached;
  * when present, the value returned by define() is ignored and define() may
  * return void.
  *
+ * define() may also return an owning string (e.g. std::string): it is then
+ * evaluated once per type and cached.
+ *
  * If a type has both a TypeDefinitionTrait specialization and a
  * TypeDefinition() overload found by argument-dependent lookup, the trait wins.
+ * A specialization whose define() can not be called as
+ * define(T&, AddField&) is a compile error (it is never silently ignored).
  *
  * The specialization must be visible before the type is first used with
  * DataTamer (as for any template specialization).
@@ -115,6 +121,8 @@ namespace DataTamer
 template <typename T, typename = void>
 struct TypeDefinitionTrait
 {
+  // Marks the primary template: a specialization does not have it.
+  using unspecialized_tag = void;
 };
 }  // namespace DataTamer
 
@@ -132,6 +140,19 @@ template <typename T>
 struct has_TypeDefinitionTrait<
     T, std::void_t<decltype(DataTamer::TypeDefinitionTrait<T>::define(
            std::declval<T&>(), std::declval<EmptyFunc&>()))>> : std::true_type
+{
+};
+
+// True if DataTamer::TypeDefinitionTrait<T> is specialized at all.
+template <typename T, class = void>
+struct is_TypeDefinitionTrait_specialized : std::true_type
+{
+};
+
+template <typename T>
+struct is_TypeDefinitionTrait_specialized<
+    T, std::void_t<typename DataTamer::TypeDefinitionTrait<T>::unspecialized_tag>>
+  : std::false_type
 {
 };
 
@@ -175,6 +196,10 @@ template <typename T, class = void>
 struct has_TypeDefinition : std::bool_constant<has_TypeDefinitionTrait<T>::value ||
                                                has_TypeDefinitionADL<T>::value>
 {
+  static_assert(!is_TypeDefinitionTrait_specialized<T>::value ||
+                    has_TypeDefinitionTrait<T>::value,
+                "DataTamer::TypeDefinitionTrait<T> is specialized, but it has no "
+                "static define(T&, AddField&) callable with a generic AddField");
 };
 
 // Call the definition of T: DataTamer::TypeDefinitionTrait<T>::define() if
@@ -183,6 +208,7 @@ struct has_TypeDefinition : std::bool_constant<has_TypeDefinitionTrait<T>::value
 template <typename T, typename AddField>
 inline decltype(auto) InvokeTypeDefinition(T& obj, AddField& add_field)
 {
+  static_assert(has_TypeDefinition<T>::value, "Missing TypeDefinition");
   if constexpr(has_TypeDefinitionTrait<T>::value)
   {
     return DataTamer::TypeDefinitionTrait<T>::define(obj, add_field);
