@@ -4,6 +4,18 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* New ``MCAPRingSink`` (``data_tamer/sinks/mcap_ring_sink.hpp``, #95), a flight
+  recorder: it keeps the last ``window`` of every attached channel in a
+  preallocated RAM ring (evicted by age and by ``capacity_bytes``) and writes
+  an MCAP file only on ``requestDump(post_trigger)``, which is lock-free and
+  allocation-free for real-time threads. The dump covers ``[T - window,
+  T + post_trigger]`` in snapshot time, ``T`` being the first snapshot after
+  the request, with the schema and channel records of every channel in it.
+  A writer thread of the sink writes the file from a second buffer, so the
+  sink worker never waits for disk; a finished dump that finds the writer busy
+  is handed over at the next snapshot. ``flushPendingDump()`` writes a request
+  made just before ``SinkWorker::stop()``. Dump ``N`` is written to
+  ``details::NumberedPath(filepath, N)``. Example ``T04_flight_recorder``.
 * **Breaking, MCAP rollover** (#98): when ``setMaxTimeBeforeReset`` expires
   (600 s by default), ``MCAPSink`` now continues in a new numbered file instead
   of truncating the current one, so nothing recorded is discarded. Truncation is
