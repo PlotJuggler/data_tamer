@@ -108,8 +108,8 @@ public:
    * A name must be unique in the channel, must not be empty, must not contain
    * spaces and must not have empty '/'-separated components (no leading,
    * trailing or repeated '/'): use JoinNames() to build hierarchical names.
-   * The same rules apply to the field names in a TypeDefinition, including
-   * nested types. Violations throw std::runtime_error naming the channel and
+   * The same rules apply to the field names in a TypeDefinition (or
+   * TypeDefinitionTrait), including nested types. Violations throw std::runtime_error naming the channel and
    * the value, and leave the channel unchanged.
    *
    * @param name   name of the value
@@ -379,7 +379,7 @@ private:
   template <typename T>
   void updateTypeRegistryImpl(FieldsVector& fields, const char* name);
 
-  /// The only place that invokes a user TypeDefinition.
+  /// The only place that invokes a user TypeDefinition / TypeDefinitionTrait.
   template <typename T, typename AddField>
   static void visitTypeDefinition(AddField& add_field);
 
@@ -392,7 +392,7 @@ private:
 
   /// Throws std::runtime_error, naming the channel, if `name` is not a valid value name.
   void checkValueName(const std::string& name) const;
-  /// Same rules for a field name of a custom type's TypeDefinition.
+  /// Same rules for a field name of a custom type's TypeDefinition (or trait).
   void checkFieldName(std::string_view type_name, std::string_view field_name) const;
 
   [[nodiscard]] RegistrationID registerValueImpl(const std::string& name,
@@ -449,7 +449,7 @@ template <typename T, typename AddField>
 inline void LogChannel::visitTypeDefinition(AddField& add_field)
 {
   T dummy;
-  TypeDefinition(dummy, add_field);
+  SerializeMe::InvokeTypeDefinition(dummy, add_field);
 }
 
 template <typename T>

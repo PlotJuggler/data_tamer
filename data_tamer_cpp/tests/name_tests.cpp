@@ -102,6 +102,48 @@ std::string_view TypeDefinition(TreeNode& obj, AddField& add)
 }
 }  // namespace
 
+// Types described only by DataTamer::TypeDefinitionTrait (no ADL overload), and
+// one with both, where the trait is the definition that is registered.
+namespace names_third_party
+{
+struct TraitBad
+{
+  double x = 0;
+};
+struct BothBadTrait
+{
+  double x = 0;
+};
+template <typename AddField>
+std::string_view TypeDefinition(BothBadTrait& obj, AddField& add)
+{
+  add("x", &obj.x);  // valid, but not the definition in use
+  return "BothBadTrait";
+}
+}  // namespace names_third_party
+
+template <>
+struct DataTamer::TypeDefinitionTrait<names_third_party::TraitBad>
+{
+  template <typename AddField>
+  static std::string_view define(names_third_party::TraitBad& obj, AddField& add)
+  {
+    add("a//x", &obj.x);
+    return "TraitBad";
+  }
+};
+
+template <>
+struct DataTamer::TypeDefinitionTrait<names_third_party::BothBadTrait>
+{
+  template <typename AddField>
+  static std::string_view define(names_third_party::BothBadTrait& obj, AddField& add)
+  {
+    add("x/", &obj.x);
+    return "BothBadTrait";
+  }
+};
+
 TEST(Names, JoinNamesCollapsesSlashes)
 {
   EXPECT_EQ(JoinNames("loco", "torso", "x"), "loco/torso/x");
@@ -208,6 +250,24 @@ TEST(Names, RejectsInvalidFieldNamesOfNestedTypes)
   TreeNode tree;
   EXPECT_NO_THROW((void)channel->registerValue("tree", &tree));
   EXPECT_EQ(channel->getSchema().custom_types.count("TreeNode"), 1u);
+}
+
+TEST(Names, RejectsInvalidFieldNamesOfTraitTypes)
+{
+  auto channel = LogChannel::create("chan");
+  names_third_party::TraitBad trait_only;
+  auto msg = RegistrationError([&] { (void)channel->registerValue("t", &trait_only); });
+  EXPECT_TRUE(Contains(msg, "custom type 'TraitBad'")) << msg;
+  EXPECT_TRUE(Contains(msg, "'a//x'")) << msg;
+
+  // The trait wins over the ADL overload, for validation as for registration.
+  names_third_party::BothBadTrait both;
+  msg = RegistrationError([&] { (void)channel->registerValue("b", &both); });
+  EXPECT_TRUE(Contains(msg, "'x/'")) << msg;
+
+  const auto schema = channel->getSchema();
+  EXPECT_TRUE(schema.fields.empty());
+  EXPECT_TRUE(schema.custom_types.empty());
 }
 
 TEST(Names, ErrorsNameChannelAndValue)
