@@ -74,28 +74,46 @@ private:
 //------------------------------------------------------------------
 //------------------------------------------------------------------
 
+// Name of a custom type, as written in the schema.
+// It comes from DataTamer::TypeDefinitionTrait<T>::name() when provided
+// (built once at runtime and cached for the lifetime of the process),
+// otherwise from the string_view returned by the definition of T.
 template <typename T>
 struct CustomTypeName
 {
-  static constexpr std::string_view get()
+  static std::string_view get()
   {
-    static_assert(std::is_default_constructible_v<T>, "Must be default constructible");
     static_assert(SerializeMe::has_TypeDefinition<T>(), "Missing TypeDefinition");
-    T dummy;
-    return TypeDefinition(dummy, SerializeMe::EmptyFuncion);
+    if constexpr(SerializeMe::has_TypeDefinitionTrait<T>::value &&
+                 SerializeMe::has_TypeDefinitionTraitName<T>::value)
+    {
+      static const std::string name = TypeDefinitionTrait<T>::name();
+      return name;
+    }
+    else
+    {
+      static_assert(std::is_default_constructible_v<T>, "Must be default constructible");
+      using Result = decltype(SerializeMe::InvokeTypeDefinition(
+          std::declval<T&>(), std::declval<SerializeMe::EmptyFunc&>()));
+      // Otherwise define() must return the name of the type
+      constexpr bool returns_name = std::is_convertible_v<Result, std::string_view>;
+      static_assert(returns_name, "TypeDefinition must return the type name");
+      T dummy;
+      return SerializeMe::InvokeTypeDefinition(dummy, SerializeMe::EmptyFuncion);
+    }
   }
 };
 
 template <template <class, class> class Container, class T, class... TArgs>
 struct CustomTypeName<Container<T, TArgs...>>
 {
-  static constexpr std::string_view get() { return CustomTypeName<T>::get(); }
+  static std::string_view get() { return CustomTypeName<T>::get(); }
 };
 
 template <typename T, size_t N>
 struct CustomTypeName<std::array<T, N>>
 {
-  static constexpr std::string_view get() { return CustomTypeName<T>::get(); }
+  static std::string_view get() { return CustomTypeName<T>::get(); }
 };
 
 template <class C, typename T>
@@ -137,7 +155,7 @@ inline void GetFixedSize(bool& is_fixed_size, size_t& fixed_size)
           GetFixedSize<MemberType>(is_fixed_size, fixed_size);
         };
         T dummy;
-        TypeDefinition(dummy, funcA);
+        InvokeTypeDefinition(dummy, funcA);
       }
       else
       {
@@ -197,7 +215,6 @@ inline CustomSerializer::Ptr TypesRegistry::getSerializer()
                                      "numerical type.");
 
   std::scoped_lock lk(_mutex);
-  T dummy;
   const std::string type_name(CustomTypeName<T>::get());
   auto it = _types.find(type_name);
 

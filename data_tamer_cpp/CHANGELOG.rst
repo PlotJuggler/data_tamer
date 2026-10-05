@@ -4,6 +4,17 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* New customization point ``DataTamer::TypeDefinitionTrait<T, Enable = void>``
+  (#94): describe a type with a ``static define(T&, AddField&)`` specialization
+  instead of a ``TypeDefinition`` overload in the type's own namespace, so
+  third-party types (Eigen, ...) no longer require reopening their namespace.
+  Partial specializations (including ``enable_if`` on the second parameter) are
+  supported. An optional ``static std::string name()`` builds the type name at
+  runtime (once per type), e.g. for class templates. When both a trait and an
+  ADL ``TypeDefinition`` exist, the trait wins. Existing ``TypeDefinition``
+  overloads keep working. ``CustomTypeName<T>::get()`` is no longer
+  ``constexpr``. ``SerializeMe::DeserializeFromBuffer`` now compiles for custom
+  types (it passed const field pointers and could not write the fields).
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /
