@@ -267,43 +267,47 @@ def _split_entry(content: str, line: str) -> tuple[str, str]:
     return key, rest.strip()
 
 
+@dataclass
+class _YamlLevel:
+    parent_indent: int
+    indent: int | None  # indentation of the mapping's entries; None if not seen yet
+    entries: list
+    keys: set = field(default_factory=set)
+
+
 # A node is (key, scalar, children); children is None for a scalar entry.
 def _parse_yaml_tree(text: str) -> list:
     root: list = []
-    # (indent of the mapping's entries or None if not seen yet, entries, keys)
-    stack = [[0, root, set()]]
-    parent_indent = [-1]
+    stack = [_YamlLevel(-1, 0, root)]  # top level starts at column 0
     for raw in text.split("\n"):
         line = raw.rstrip(" \r")
         content = line.lstrip(" ")
         if not content or content.startswith("#"):
             continue
-        if content.startswith("\t") or "\t" in line[:len(line) - len(content)]:
+        if content.startswith("\t"):
             raise ValueError(f"tab indentation in {line!r}")
         indent = len(line) - len(content)
-        while indent <= parent_indent[-1]:
+        while indent <= stack[-1].parent_indent:
             stack.pop()
-            parent_indent.pop()
         level = stack[-1]
-        if level[0] is None:
-            level[0] = indent
-        elif indent != level[0]:
+        if level.indent is None:
+            level.indent = indent
+        elif indent != level.indent:
             raise ValueError(f"bad indentation in {line!r}")
         key, rest = _split_entry(content, line)
-        if key in level[2]:
+        if key in level.keys:
             raise ValueError(f"duplicate key {key!r}")
-        level[2].add(key)
+        level.keys.add(key)
         if rest == "":
             if len(stack) > MAX_SCHEMA_DEPTH:
                 raise ValueError(f"nesting too deep in {line!r}")
             children: list = []
-            level[1].append((key, None, children))
-            stack.append([None, children, set()])
-            parent_indent.append(indent)
+            level.entries.append((key, None, children))
+            stack.append(_YamlLevel(indent, None, children))
         elif rest == "{}":
-            level[1].append((key, None, []))
+            level.entries.append((key, None, []))
         else:
-            level[1].append((key, _scalar(rest, line), None))
+            level.entries.append((key, _scalar(rest, line), None))
     return root
 
 
@@ -336,8 +340,9 @@ def _parse_schema_yaml(text: str, verify_hash: bool) -> Schema:
             raise ValueError(f"YAML schema: {key!r} must be a mapping")
         return top[key][1]
 
-    if _parse_uint(scalar("version"), "version") != SCHEMA_YAML_VERSION:
-        raise ValueError(f"unsupported YAML schema version {scalar('version')!r}")
+    version = scalar("version")
+    if _parse_uint(version, "version") != SCHEMA_YAML_VERSION:
+        raise ValueError(f"unsupported YAML schema version {version!r}")
     schema = Schema(channel_name=scalar("channel_name"),
                     hash=_parse_uint(scalar("hash"), "hash"))
     _flatten(mapping("fields", True), "", schema.fields)

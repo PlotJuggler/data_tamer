@@ -128,26 +128,24 @@ uint64_t ComputeSchemaHash(const Schema& schema)
   return SchemaTextHash(ToStr(schema));
 }
 
+namespace
+{
+/// "type", "type[]" or "type[N]": the only renderer of a field's type, shared by
+/// the line format (which the schema hash is computed on) and ToYaml().
+std::string TypeSpec(const TypeField& field)
+{
+  std::string spec = field.type == BasicType::OTHER ? field.type_name : ToStr(field.type);
+  if(field.is_vector)
+  {
+    spec += field.array_size == 0 ? "[]" : "[" + std::to_string(field.array_size) + "]";
+  }
+  return spec;
+}
+}  // namespace
+
 std::ostream& operator<<(std::ostream& os, const TypeField& field)
 {
-  if(field.type == BasicType::OTHER)
-  {
-    os << field.type_name;
-  }
-  else
-  {
-    os << ToStr(field.type);
-  }
-
-  if(field.is_vector && field.array_size != 0)
-  {
-    os << "[" << field.array_size << "]";
-  }
-  if(field.is_vector && field.array_size == 0)
-  {
-    os << "[]";
-  }
-  os << ' ' << field.field_name;
+  os << TypeSpec(field) << ' ' << field.field_name;
   return os;
 }
 
@@ -360,22 +358,9 @@ void WriteName(std::ostream& os, std::string_view s)
   }
 }
 
-std::string TypeSpec(const TypeField& field)
-{
-  std::string spec = field.type == BasicType::OTHER ? field.type_name : ToStr(field.type);
-  if(field.is_vector)
-  {
-    spec += field.array_size == 0 ? "[]" : "[" + std::to_string(field.array_size) + "]";
-  }
-  return spec;
-}
-
 void Indent(std::ostream& os, int indent)
 {
-  for(int i = 0; i < indent; i++)
-  {
-    os << ' ';
-  }
+  os << std::string(static_cast<size_t>(indent), ' ');
 }
 
 using NamedField = std::pair<std::string_view, const TypeField*>;

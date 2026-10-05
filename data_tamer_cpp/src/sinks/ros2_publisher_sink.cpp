@@ -11,6 +11,17 @@
 namespace DataTamer
 {
 
+namespace
+{
+void FillSnapshotMsg(const Snapshot& snapshot, data_tamer_msgs::msg::Snapshot& msg)
+{
+  msg.timestamp_nsec = uint64_t(snapshot.timestamp.count());
+  msg.schema_hash = snapshot.schema_hash;
+  msg.active_mask = snapshot.active_mask;
+  msg.payload = snapshot.payload;
+}
+}  // namespace
+
 struct ROS2PublisherSink::Pimpl
 {
   Pimpl(PublisherNodeInterfaces interfaces, const ROS2PublisherOptions& opts)
@@ -36,6 +47,10 @@ struct ROS2PublisherSink::Pimpl
   data_tamer_msgs::msg::Snapshot data_msg;
 
   data_tamer_msgs::msg::SnapshotBatch batch_msg;
+  // Snapshots of the current batch: the first batch_count elements of
+  // batch_msg.snapshots. Elements are reused across batches, so that copying a
+  // snapshot into them does not allocate once their buffers have grown.
+  size_t batch_count = 0;
   std::chrono::steady_clock::time_point batch_start;
 
   PublisherNodeInterfaces node_interface;
@@ -112,17 +127,14 @@ void ROS2PublisherSink::onSnapshot(const SnapshotRef& ref)
     _p->addToBatch(snapshot);
     return;
   }
-  _p->data_msg.timestamp_nsec = uint64_t(snapshot.timestamp.count());
-  _p->data_msg.schema_hash = snapshot.schema_hash;
-  _p->data_msg.active_mask = snapshot.active_mask;
-  _p->data_msg.payload = snapshot.payload;
+  FillSnapshotMsg(snapshot, _p->data_msg);
   _p->data_publisher->publish(_p->data_msg);
 }
 
 void ROS2PublisherSink::flush()
 {
   std::lock_guard lock(_p->mutex);
-  if(_p->options.aggregate && !_p->batch_msg.snapshots.empty())
+  if(_p->options.aggregate && _p->batch_count > 0)
   {
     _p->publishSchemasIfChanged();
     _p->publishBatch();
@@ -148,16 +160,16 @@ void ROS2PublisherSink::Pimpl::publishSchemasIfChanged()
 void ROS2PublisherSink::Pimpl::addToBatch(const Snapshot& snapshot)
 {
   const auto now = std::chrono::steady_clock::now();
-  if(batch_msg.snapshots.empty())
+  auto& snapshots = batch_msg.snapshots;
+  if(batch_count == 0)
   {
     batch_start = now;
   }
-
-  auto& snapshot_msg = batch_msg.snapshots.emplace_back();
-  snapshot_msg.timestamp_nsec = uint64_t(snapshot.timestamp.count());
-  snapshot_msg.schema_hash = snapshot.schema_hash;
-  snapshot_msg.active_mask = snapshot.active_mask;
-  snapshot_msg.payload = snapshot.payload;
+  if(batch_count == snapshots.size())
+  {
+    snapshots.emplace_back();
+  }
+  FillSnapshotMsg(snapshot, snapshots[batch_count++]);
 
   if(options.embed_schemas)
   {
@@ -174,7 +186,7 @@ void ROS2PublisherSink::Pimpl::addToBatch(const Snapshot& snapshot)
     }
   }
 
-  const bool full = batch_msg.snapshots.size() >= options.max_batch_size;
+  const bool full = batch_count >= options.max_batch_size;
   const bool expired = options.max_batch_delay.count() > 0 &&
                        (now - batch_start) >= options.max_batch_delay;
   if(full || expired)
@@ -189,13 +201,15 @@ void ROS2PublisherSink::Pimpl::publishBatch()
   // drops one batch instead of growing it without bound.
   struct Clear
   {
-    data_tamer_msgs::msg::SnapshotBatch& msg;
+    Pimpl& p;
     ~Clear()
     {
-      msg.snapshots.clear();
-      msg.schemas.clear();
+      p.batch_count = 0;
+      p.batch_msg.schemas.clear();
     }
-  } clear{ batch_msg };
+  } clear{ *this };
+  // Only a partial batch (flush) has spare elements to drop before publishing.
+  batch_msg.snapshots.resize(batch_count);
   batch_publisher->publish(batch_msg);
 }
 
