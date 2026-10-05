@@ -36,21 +36,24 @@ namespace DataTamer
 
 static constexpr char const* kDataTamer = "data_tamer";
 
-namespace
+namespace details
 {
-// "log.mcap" -> "log_3.mcap"; a path without an extension gets the suffix appended.
 std::string NumberedPath(const std::string& path, size_t number)
 {
   const auto suffix = "_" + std::to_string(number);
   const auto slash = path.find_last_of("/\\");
-  const auto dot = path.rfind('.');
-  if(dot == std::string::npos || (slash != std::string::npos && dot < slash))
+  const size_t name_begin = (slash == std::string::npos) ? 0 : slash + 1;
+  // Skip the leading dots of a hidden file (".foo"): they are not an extension.
+  const size_t stem_begin = path.find_first_not_of('.', name_begin);
+  const size_t dot =
+      (stem_begin == std::string::npos) ? std::string::npos : path.find('.', stem_begin);
+  if(dot == std::string::npos)
   {
     return path + suffix;
   }
   return path.substr(0, dot) + suffix + path.substr(dot);
 }
-}  // namespace
+}  // namespace details
 
 struct MCAPSink::Pimpl
 {
@@ -58,10 +61,16 @@ struct MCAPSink::Pimpl
   bool compression = false;
   std::unique_ptr<mcap::McapWriter> writer;
 
-  std::unordered_map<uint64_t, uint16_t> hash_to_channel_id;
+  struct ChannelInfo
+  {
+    mcap::ChannelId id = 0;
+    // Sequence number of the next message, per MCAP channel and per file.
+    uint32_t next_sequence = 1;
+  };
+  std::unordered_map<uint64_t, ChannelInfo> hash_to_channel;
   std::unordered_map<uint64_t, Schema> schemas;
 
-  bool create_file_on_reset = false;
+  bool create_file_on_reset = true;
   std::string original_filepath;
   size_t file_reset_counter = 1;
 
@@ -97,7 +106,7 @@ void DataTamer::MCAPSink::openFile(std::string const& filepath)
   }
   _p->writer = std::move(writer);  // closes the previous file
   _p->start_time = std::chrono::system_clock::now();
-  _p->hash_to_channel_id.clear();
+  _p->hash_to_channel.clear();
 }
 
 MCAPSink::~MCAPSink() = default;
@@ -107,8 +116,8 @@ void MCAPSink::onSchema(Schema const& schema)
   std::scoped_lock lk(_p->mutex);
   _p->schemas[schema.hash] = schema;
   const auto& channel_name = schema.channel_name;
-  auto it = _p->hash_to_channel_id.find(schema.hash);
-  if(it != _p->hash_to_channel_id.end() || !_p->writer)  // stopped: re-added on restart
+  auto it = _p->hash_to_channel.find(schema.hash);
+  if(it != _p->hash_to_channel.end() || !_p->writer)  // stopped: re-added on restart
   {
     return;
   }
@@ -126,7 +135,7 @@ void MCAPSink::onSchema(Schema const& schema)
   // Register a Channel
   mcap::Channel publisher(channel_name, kDataTamer, mcap_schema.id);
   _p->writer->addChannel(publisher);
-  _p->hash_to_channel_id[schema.hash] = publisher.id;
+  _p->hash_to_channel[schema.hash].id = publisher.id;
 }
 
 void MCAPSink::onSnapshot(const SnapshotRef& ref)
@@ -149,8 +158,9 @@ void MCAPSink::onSnapshot(const SnapshotRef& ref)
 
   // Write our message
   mcap::Message msg;
-  msg.channelId = _p->hash_to_channel_id.at(snapshot.schema_hash);
-  msg.sequence = 1;  // Optional
+  auto& channel = _p->hash_to_channel.at(snapshot.schema_hash);
+  msg.channelId = channel.id;
+  msg.sequence = channel.next_sequence++;
   // Timestamp requires nanosecond
   msg.logTime = mcap::Timestamp(snapshot.timestamp.count());
   msg.publishTime = msg.logTime;
@@ -162,15 +172,15 @@ void MCAPSink::onSnapshot(const SnapshotRef& ref)
     throw std::runtime_error("MCAP write failed: " + status.message);
   }
 
-  // If reset_time is exceeded, we want to overwrite the current file.
-  // Better than filling the disk, if you forgot to stop the application.
+  // If reset_time is exceeded, continue in a new numbered file (or truncate
+  // the current one, if create_file_on_reset was disabled).
   if(_p->reset_time != std::chrono::seconds(0) &&
      std::chrono::system_clock::now() - _p->start_time > _p->reset_time)
   {
     if(_p->create_file_on_reset)
     {
       // change the current filepath to the original with "_[# resets]"" appended
-      _p->filepath = NumberedPath(_p->original_filepath, _p->file_reset_counter);
+      _p->filepath = details::NumberedPath(_p->original_filepath, _p->file_reset_counter);
       ++_p->file_reset_counter;
     }
     restartRecordingImpl(_p->filepath, _p->compression, false);

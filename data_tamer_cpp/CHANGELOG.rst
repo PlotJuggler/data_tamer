@@ -4,6 +4,15 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* **Breaking, MCAP rollover** (#98): when ``setMaxTimeBeforeReset`` expires
+  (600 s by default), ``MCAPSink`` now continues in a new numbered file instead
+  of truncating the current one, so nothing recorded is discarded. Truncation is
+  opt-in with ``setCreateNewFileOnReset(false)``. The counter is inserted before
+  the first dot of the file name, so multi-part extensions survive:
+  ``run.tamer.mcap`` rolls over to ``run_1.tamer.mcap`` (it was
+  ``run.tamer_1.mcap``).
+* MCAP messages carry a per-channel ``sequence`` number (1, 2, 3, ... per MCAP
+  channel and file) instead of always 1, so readers can detect gaps (#98).
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /

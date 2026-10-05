@@ -15,6 +15,17 @@ namespace DataTamer
  * worker to LogChannel::addDataSink(); reach the methods below through
  * worker->as<MCAPSink>().
  */
+namespace details
+{
+/// File name used for rollover number `number` of `path`. The counter goes
+/// before the first dot of the file name (directories are left alone), so
+/// multi-part extensions survive: "dir.d/run.tamer.mcap" -> "dir.d/run_1.tamer.mcap".
+/// A name without a dot gets the counter appended ("log" -> "log_1"); the
+/// leading dots of a hidden file belong to the name (".rec.mcap" -> ".rec_1.mcap",
+/// ".rec" -> ".rec_1").
+std::string NumberedPath(const std::string& path, size_t number);
+}  // namespace details
+
 class MCAPSink : public DataSink
 {
 public:
@@ -38,15 +49,19 @@ public:
 
   ~MCAPSink() override;
 
-  /// After a certain amount of time, the MCAP file will be reset
-  /// and overwritten. Default value is 600 seconds (10 minutes)
-  /// To disable this feature, use a time of 0 seconds.
-  /// WARNING: this can consume a large amount of disk space very quickly.
+  /// After a certain amount of time, the MCAP file is closed and the recording
+  /// continues in a new file (see setCreateNewFileOnReset). Default value is
+  /// 600 seconds (10 minutes). To disable this feature, use a time of 0 seconds.
+  /// WARNING: without a reset the file grows for as long as the application runs.
   void setMaxTimeBeforeReset(std::chrono::seconds reset_time);
 
-  /// When resetting the MCAP recording (see `setMaxTimeBeforeReset`),
-  /// if `create_new_file` is true then the filename will be incremented
-  /// and then saved instead of overwriting the previous file.
+  /// What happens on a reset (see `setMaxTimeBeforeReset`).
+  /// If `create_new_file` is true (default), the recording continues in a new
+  /// file whose name carries a counter, inserted before the first dot of the
+  /// file name: "run.tamer.mcap" -> "run_1.tamer.mcap", "run_2.tamer.mcap", ...
+  /// (see details::NumberedPath). Nothing is lost, but disk usage is unbounded.
+  /// If false, the same file is truncated and restarted: everything recorded
+  /// before the reset is DISCARDED. Use it only to bound disk usage.
   void setCreateNewFileOnReset(bool create_new_file);
 
   /// Stop recording and save the file. Snapshots delivered afterwards are
