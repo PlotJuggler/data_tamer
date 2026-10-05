@@ -704,14 +704,26 @@ TEST(MCAPRingSink, ReportsWriteFailure)
   {
     GTEST_SKIP() << "file size limit already below the test size";
   }
-  const auto previous_handler = std::signal(SIGXFSZ, SIG_IGN);
-  rlimit limited = original;
-  limited.rlim_cur = 4096;
-  ASSERT_EQ(::setrlimit(RLIMIT_FSIZE, &limited), 0);
-  ASSERT_TRUE(sink->requestDump());
-  const bool flushed = sink->flushPendingDump();
-  ::setrlimit(RLIMIT_FSIZE, &original);
-  std::signal(SIGXFSZ, previous_handler);
+  bool flushed = false;
+  {
+    // Restores the limit and the handler on every path, ASSERTs included, so
+    // that later tests in this process can write files.
+    struct Restore
+    {
+      rlimit limit;
+      void (*handler)(int);
+      ~Restore()
+      {
+        ::setrlimit(RLIMIT_FSIZE, &limit);
+        std::signal(SIGXFSZ, handler);
+      }
+    } restore{ original, std::signal(SIGXFSZ, SIG_IGN) };
+    rlimit limited = original;
+    limited.rlim_cur = 4096;
+    ASSERT_EQ(::setrlimit(RLIMIT_FSIZE, &limited), 0);
+    ASSERT_TRUE(sink->requestDump());
+    flushed = sink->flushPendingDump();
+  }
 
   ASSERT_TRUE(flushed);
   EXPECT_FALSE(info.ok);

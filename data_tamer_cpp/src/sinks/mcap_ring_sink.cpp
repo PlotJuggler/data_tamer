@@ -278,7 +278,8 @@ bool MCAPRingSink::Pimpl::tryHandOff()
     job.end = dump_end;
     job.first_message = job.last_message = nanoseconds(0);
     job.messages = 0;
-    job.truncated = capacity_evicted_until >= dump_start;
+    job.truncated =
+        capacity_evicted_until >= dump_start && capacity_evicted_until <= dump_end;
     job.ok = false;
     writer_busy = true;
   }
@@ -413,7 +414,12 @@ void MCAPRingSink::Pimpl::writeDump(MCAPRingDump& dump)
   }
   catch(const std::exception& e)
   {
-    dump.error = e.what();
+    try
+    {
+      dump.error = e.what();
+    }
+    catch(...)
+    {}  // bad_alloc while reporting: ok stays false
   }
 }
 
@@ -429,8 +435,8 @@ MCAPRingSink::MCAPRingSink(MCAPRingOptions options)
   {
     throw std::invalid_argument("MCAPRingSink: window must not be negative");
   }
-  _p = std::make_unique<Pimpl>(std::move(options));
-  _p->writer_thread = std::thread([this] { _p->writerLoop(); });
+  _p = std::make_shared<Pimpl>(std::move(options));
+  _p->writer_thread = std::thread([p = _p] { p->writerLoop(); });
 }
 
 MCAPRingSink::~MCAPRingSink()
@@ -440,7 +446,17 @@ MCAPRingSink::~MCAPRingSink()
     _p->writer_stop = true;
   }
   _p->writer_cv.notify_all();
-  _p->writer_thread.join();
+  if(_p->writer_thread.get_id() == std::this_thread::get_id())
+  {
+    // Destroyed from the dump callback: joining would deadlock. The writer
+    // thread holds its own reference to the Pimpl and exits once the callback
+    // returns.
+    _p->writer_thread.detach();
+  }
+  else
+  {
+    _p->writer_thread.join();
+  }
 }
 
 bool MCAPRingSink::requestDump(std::chrono::nanoseconds post_trigger)

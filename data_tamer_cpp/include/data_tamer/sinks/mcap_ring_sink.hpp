@@ -48,6 +48,9 @@ struct MCAPRingDump
   size_t messages = 0;
   /// The ring was full and evicted snapshots of [start, end] before the
   /// dump was written: the file starts later than `start`. Raise capacity_bytes.
+  /// (Evictions are tracked by their newest timestamp; after snapshot time
+  /// jumps backwards, e.g. a simulation reset, only evictions stamped within
+  /// [start, end] count.)
   bool truncated = false;
   /// False if the file could not be opened or written (disk full, I/O error):
   /// `error` says why. A partially written file is left at `path`.
@@ -169,7 +172,9 @@ protected:
 
 private:
   struct Pimpl;
-  std::unique_ptr<Pimpl> _p;
+  // Shared with the writer thread, so that it outlives a sink destroyed from
+  // its own dump callback.
+  std::shared_ptr<Pimpl> _p;
 };
 
 }  // namespace DataTamer
