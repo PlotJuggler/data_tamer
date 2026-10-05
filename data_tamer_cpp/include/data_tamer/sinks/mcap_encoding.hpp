@@ -4,8 +4,8 @@
 #include "data_tamer/data_sink.hpp"
 #include "data_tamer/types.hpp"
 
-// See "Building against it" below: never define MCAP_IMPLEMENTATION before
-// including this header outside ROS 2.
+// See "Building against it" below: do not define MCAP_IMPLEMENTATION.
+// (Internal: mcap_sink.cpp, which does, defines it before including this header.)
 #include <mcap/writer.hpp>
 
 #include <algorithm>
@@ -24,11 +24,17 @@
  * stores snapshots and writes them later.
  *
  *   mcap::McapWriter writer;
- *   writer.open(path, mcap::McapWriterOptions(mcap_encoding::kEncoding));
+ *   if(!writer.open(path, mcap::McapWriterOptions(mcap_encoding::kEncoding)).ok())
+ *     return false;
  *   const auto id = mcap_encoding::AddChannel(writer, schema);
  *   std::vector<uint8_t> scratch;  // reused: no allocation once large enough
  *   uint32_t sequence = 1;
- *   mcap_encoding::WriteSnapshot(writer, id, sequence++, snapshot, scratch);
+ *   for(const Snapshot& snapshot : stored)
+ *   {
+ *     if(!mcap_encoding::WriteSnapshot(writer, id, sequence++, snapshot, scratch).ok())
+ *       return false;
+ *   }
+ *   writer.close();
  *
  * Sequence numbers are provided by the caller: MCAPSink counts 1, 2, 3, ... per
  * MCAP channel and file, and a writer of stored data should do the same (or
@@ -44,10 +50,6 @@
  *   the definitions would be duplicated. Do not mix in another MCAP version.
  * - Under ROS 2, MCAP comes from mcap_vendor, which is not compiled into
  *   libdata_tamer: link mcap_vendor::mcap as well.
- * - MCAP's headers use #pragma once. In a translation unit that does define
- *   MCAP_IMPLEMENTATION (only one that compiles MCAP itself), define it before
- *   the first include of any MCAP header, including this one: after
- *   <mcap/writer.hpp> was included once, a later define has no effect.
  */
 namespace DataTamer::mcap_encoding
 {

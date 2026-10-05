@@ -73,12 +73,20 @@ target_include_directories(data_tamer
 )
 target_compile_definitions(data_tamer PUBLIC DATA_TAMER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(data_tamer PUBLIC Threads::Threads)
-if(DATA_TAMER_BUILD_ROS)
+if(TARGET mcap_lib)
+    # Bundled MCAP. sinks/mcap_encoding.hpp includes its headers, so they are
+    # PUBLIC (mcap_headers: include path only, no link dependencies), while
+    # mcap_lib and zstd/lz4 stay PRIVATE: shared installs export no
+    # machine-specific library paths. libdata_tamer compiles the MCAP
+    # implementation itself (mcap_sink.cpp), so consumers get the headers of
+    # the exact MCAP version it was built with.
+    target_link_libraries(data_tamer
+        PUBLIC mcap_headers
+        PRIVATE ${DATA_TAMER_MCAP_TARGET})
+elseif(DATA_TAMER_BUILD_ROS)
     target_link_libraries(data_tamer PRIVATE ${DATA_TAMER_MCAP_TARGET})
 else()
-    # PUBLIC: sinks/mcap_encoding.hpp includes the MCAP headers. libdata_tamer
-    # compiles the MCAP implementation itself (mcap_sink.cpp), so consumers get
-    # the headers of the exact MCAP version it was built with.
+    # Installed MCAP package: found again by data_tamerConfig.cmake.
     target_link_libraries(data_tamer PUBLIC ${DATA_TAMER_MCAP_TARGET})
 endif()
 
@@ -99,10 +107,14 @@ if(DATA_TAMER_BUILD_ROS)
     )
 
     ament_export_targets(data_tamerTargets HAS_LIBRARY_TARGET)
-    ament_export_dependencies(mcap_vendor rclcpp rclcpp_lifecycle data_tamer_msgs)
+    ament_export_dependencies(Threads mcap_vendor rclcpp rclcpp_lifecycle data_tamer_msgs)
     ament_package()
 elseif(TARGET mcap_lib)
-    list(APPEND INSTALL_TARGETS mcap_lib)
+    list(APPEND INSTALL_TARGETS mcap_headers)
+    if(NOT BUILD_SHARED_LIBS)
+        # A static libdata_tamer needs mcap_lib (and zstd/lz4) at link time.
+        list(APPEND INSTALL_TARGETS mcap_lib)
+    endif()
 endif()
 
 install(DIRECTORY include/ DESTINATION include)

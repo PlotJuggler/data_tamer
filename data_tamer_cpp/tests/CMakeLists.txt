@@ -5,6 +5,7 @@ set(DATATAMER_TEST_SOURCES
     parser_tests.cpp
     add_remove_sink_tests.cpp
     trait_tests.cpp
+    type_definition_trait_tests.cpp
     alloc_counter.cpp
     alloc_counter_tests.cpp
     write_mutex_tests.cpp
@@ -21,7 +22,8 @@ set(DATATAMER_TEST_SOURCES
     serialize_me_tests.cpp
     mcap_encoding_tests.cpp
     mcap_ring_sink_tests.cpp
-    wire_format_tests.cpp)
+    wire_format_tests.cpp
+    name_tests.cpp)
 
 # look for gtest from ROS, but only when building for ROS 2
 if(DATA_TAMER_BUILD_ROS)
