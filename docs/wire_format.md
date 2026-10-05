@@ -221,6 +221,10 @@ Topics under a user-chosen prefix:
   schema of every snapshot in the batch, each once, so a batch decodes on its
   own; otherwise it is empty and the `schemas` topic is needed.
 
+`ForEachSnapshotInBatch()` (C++ parser) and `iter_snapshot_batch()` (Python)
+decode a `SnapshotBatch`, using a `SchemaRegistry` filled from the embedded
+schemas and/or the `schemas` topic.
+
 ## 5. Schema hash
 
 `schema_hash` identifies a schema within one recording or one ROS session:

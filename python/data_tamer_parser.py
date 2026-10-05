@@ -8,6 +8,15 @@ line by line. Usage:
     values = parse_snapshot(schema, active_mask, payload)   # {"pose/position/x": 1.0, ...}
 
 For an MCAP message body written by MCAPSink use split_mcap_message() first.
+For the ROS 2 messages of ROS2PublisherSink (data_tamer_msgs Schemas, Snapshot,
+SnapshotBatch) use SchemaRegistry, parse_snapshot_msg() and
+iter_snapshot_batch(); they only read message attributes, so they need no ROS
+import:
+
+    registry = SchemaRegistry()
+    registry.add_schemas(schemas_msg)            # optional if the batch embeds them
+    for schema, timestamp_nsec, values in iter_snapshot_batch(registry, batch_msg):
+        ...
 """
 from __future__ import annotations
 
@@ -184,3 +193,48 @@ def split_mcap_message(data: bytes) -> tuple[bytes, bytes]:
     if start + payload_len != len(data):
         raise ValueError("MCAP message body has trailing bytes")
     return mask, payload
+
+
+class SchemaRegistry:
+    """Schemas by hash, filled from the `schemas` topic and/or embedded schemas."""
+
+    def __init__(self, verify_hash: bool = False):
+        self.verify_hash = verify_hash
+        self._schemas: dict[int, Schema] = {}
+
+    def add(self, hash_value: int, schema_text: str) -> Schema:
+        """Parse and store `schema_text` under `hash_value`, unless already known."""
+        schema = self._schemas.get(hash_value)
+        if schema is None:
+            schema = parse_schema(schema_text, verify_hash=self.verify_hash)
+            self._schemas[hash_value] = schema
+        return schema
+
+    def add_schemas(self, msg) -> None:
+        """Add every entry of `msg.schemas`: a Schemas or SnapshotBatch message."""
+        for schema_msg in msg.schemas:
+            self.add(schema_msg.hash, schema_msg.schema_text)
+
+    def find(self, hash_value: int) -> Schema | None:
+        return self._schemas.get(hash_value)
+
+    def __len__(self) -> int:
+        return len(self._schemas)
+
+
+def parse_snapshot_msg(schema: Schema, msg) -> dict[str, object]:
+    """Decode a data_tamer_msgs Snapshot (needs `active_mask` and `payload`)."""
+    return parse_snapshot(schema, bytes(msg.active_mask), bytes(msg.payload))
+
+
+def iter_snapshot_batch(registry: SchemaRegistry, batch):
+    """Yield (schema, timestamp_nsec, values) for each snapshot of a SnapshotBatch.
+
+    The schemas embedded in the batch are added to `registry` first; snapshots
+    whose schema is still unknown are skipped.
+    """
+    registry.add_schemas(batch)
+    for snapshot_msg in batch.snapshots:
+        schema = registry.find(snapshot_msg.schema_hash)
+        if schema is not None:
+            yield schema, snapshot_msg.timestamp_nsec, parse_snapshot_msg(schema, snapshot_msg)

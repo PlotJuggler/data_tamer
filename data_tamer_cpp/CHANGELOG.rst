@@ -13,6 +13,11 @@ Unreleased
   (default on) puts the schemas of the batch's snapshots in the message, so it
   decodes without the ``schemas`` topic. Schema texts are now serialized once,
   in ``onSchema()``, instead of on every republish.
+* Parser helpers to decode the ROS messages without depending on ROS (templates
+  on the message type): ``DataTamerParser::SchemaRegistry`` (schemas by hash,
+  filled from ``Schemas`` or embedded batch schemas), ``ToSnapshotView()`` and
+  ``ForEachSnapshotInBatch()``. Python equivalents in ``data_tamer_parser.py``:
+  ``SchemaRegistry``, ``parse_snapshot_msg()`` and ``iter_snapshot_batch()``.
 * **Breaking, channel API cleanup** (2.0 review items 20-24, 33):
 
   - ``RegistrationID`` is an opaque handle (no public ``first_index`` /

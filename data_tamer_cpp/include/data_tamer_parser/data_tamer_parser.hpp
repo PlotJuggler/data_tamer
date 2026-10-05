@@ -124,6 +124,54 @@ bool ParseSnapshot(const Schema& schema, SnapshotView snapshot,
                    const CustomCallback& callback_custom = NullCustomCallback);
 
 //---------------------------------------------------------
+// Helpers for the data_tamer_msgs messages published by ROS2PublisherSink.
+// They are templates on the message type, so this header does not depend on
+// ROS: any type with the same field names works.
+
+/**
+ * @brief Schemas by hash. Fill it from the `<prefix>/schemas` topic and/or from
+ * batches with embedded schemas, then look up the schema of each snapshot.
+ */
+class SchemaRegistry
+{
+public:
+  /// Parses and stores `schema_text` under `hash`, unless `hash` is already known.
+  const Schema& add(uint64_t hash, const std::string& schema_text);
+
+  /// Adds every entry of `msg.schemas` (each with `hash` and `schema_text`):
+  /// a data_tamer_msgs Schemas or SnapshotBatch message.
+  template <typename SchemasMsgT>
+  void addSchemas(const SchemasMsgT& msg);
+
+  /// nullptr if the hash is unknown.
+  [[nodiscard]] const Schema* find(uint64_t hash) const;
+
+  [[nodiscard]] size_t size() const { return schemas_.size(); }
+
+private:
+  std::unordered_map<uint64_t, Schema> schemas_;
+};
+
+/// View on a data_tamer_msgs Snapshot (`timestamp_nsec`, `schema_hash`,
+/// `active_mask`, `payload`). The message must outlive the view.
+template <typename SnapshotMsgT>
+SnapshotView ToSnapshotView(const SnapshotMsgT& msg);
+
+/**
+ * @brief Visits every snapshot of a data_tamer_msgs SnapshotBatch, in order.
+ * The schemas embedded in the batch are added to `registry` first. Snapshots
+ * whose schema is not in the registry are skipped.
+ *
+ * Callback signature: void(const Schema& schema, const SnapshotView& snapshot),
+ * typically calling ParseSnapshot(schema, snapshot, ...).
+ *
+ * @return the number of snapshots visited (skipped ones excluded).
+ */
+template <typename BatchMsgT, typename SnapshotCallback>
+size_t ForEachSnapshotInBatch(SchemaRegistry& registry, const BatchMsgT& batch,
+                              const SnapshotCallback& callback);
+
+//---------------------------------------------------------
 //---------------------------------------------------------
 //---------------------------------------------------------
 
@@ -555,6 +603,59 @@ inline bool ParseSnapshot(const Schema& schema, SnapshotView snapshot,
   }
   // every enabled field consumed exactly its bytes; leftovers mean schema/payload mismatch
   return buffer.size == 0;
+}
+
+inline const Schema& SchemaRegistry::add(uint64_t hash, const std::string& schema_text)
+{
+  auto it = schemas_.find(hash);
+  if(it == schemas_.end())
+  {
+    it = schemas_.emplace(hash, BuildSchemaFromText(schema_text)).first;
+  }
+  return it->second;
+}
+
+template <typename SchemasMsgT>
+inline void SchemaRegistry::addSchemas(const SchemasMsgT& msg)
+{
+  for(const auto& schema_msg : msg.schemas)
+  {
+    add(schema_msg.hash, schema_msg.schema_text);
+  }
+}
+
+inline const Schema* SchemaRegistry::find(uint64_t hash) const
+{
+  auto it = schemas_.find(hash);
+  return it == schemas_.end() ? nullptr : &it->second;
+}
+
+template <typename SnapshotMsgT>
+inline SnapshotView ToSnapshotView(const SnapshotMsgT& msg)
+{
+  SnapshotView view;
+  view.schema_hash = msg.schema_hash;
+  view.timestamp = msg.timestamp_nsec;
+  view.active_mask = { msg.active_mask.data(), msg.active_mask.size() };
+  view.payload = { msg.payload.data(), msg.payload.size() };
+  return view;
+}
+
+template <typename BatchMsgT, typename SnapshotCallback>
+inline size_t ForEachSnapshotInBatch(SchemaRegistry& registry, const BatchMsgT& batch,
+                                     const SnapshotCallback& callback)
+{
+  registry.addSchemas(batch);
+  size_t visited = 0;
+  for(const auto& snapshot_msg : batch.snapshots)
+  {
+    if(const Schema* schema = registry.find(snapshot_msg.schema_hash))
+    {
+      callback(*schema, ToSnapshotView(snapshot_msg));
+      visited++;
+    }
+  }
+  return visited;
 }
 
 }  // namespace DataTamerParser

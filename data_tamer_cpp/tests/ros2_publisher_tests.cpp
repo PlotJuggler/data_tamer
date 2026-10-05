@@ -2,6 +2,7 @@
 #include "data_tamer/sinks/ros2_publisher_sink.hpp"
 
 #include "data_tamer_msgs/msg/snapshot_batch.hpp"
+#include "data_tamer_parser/data_tamer_parser.hpp"
 
 #include <gtest/gtest.h>
 
@@ -191,6 +192,27 @@ TEST(DataTamerROS2Publisher, AggregateBySize)
   {
     EXPECT_EQ(snapshot.schema_hash, channel->getSchema().hash);
     EXPECT_EQ(snapshot.payload.size(), sizeof(double));
+  }
+
+  // decode with the parser helpers: the batch is self-contained
+  DataTamerParser::SchemaRegistry registry;
+  std::vector<double> values;
+  const size_t visited = DataTamerParser::ForEachSnapshotInBatch(
+      registry, *batch,
+      [&](const DataTamerParser::Schema& schema,
+          const DataTamerParser::SnapshotView& view) {
+        EXPECT_TRUE(DataTamerParser::ParseSnapshot(
+            schema, view,
+            [&](const std::string& name, const DataTamerParser::VarNumber& n) {
+              EXPECT_EQ(name, "value");
+              values.push_back(std::get<double>(n));
+            }));
+      });
+  EXPECT_EQ(visited, 5u);
+  ASSERT_EQ(values.size(), 5u);
+  for(size_t i = 1; i < values.size(); i++)
+  {
+    EXPECT_EQ(values[i], values[i - 1] + 1.0);
   }
 }
 

@@ -430,3 +430,91 @@ TEST(DataTamerParser, RejectsMalformedInput)
                                    "c\n\nint32[3 a\n"),
                std::runtime_error);
 }
+
+namespace
+{
+// Same field names as the data_tamer_msgs types, without depending on ROS.
+struct FakeSchemaMsg
+{
+  uint64_t hash;
+  std::string channel_name;
+  std::string schema_text;
+};
+struct FakeSnapshotMsg
+{
+  uint64_t timestamp_nsec;
+  uint64_t schema_hash;
+  std::vector<uint8_t> active_mask;
+  std::vector<uint8_t> payload;
+};
+struct FakeBatchMsg
+{
+  std::vector<FakeSchemaMsg> schemas;
+  std::vector<FakeSnapshotMsg> snapshots;
+};
+}  // namespace
+
+TEST(DataTamerParser, SnapshotBatchHelpers)
+{
+  auto channel = DataTamer::LogChannel::create("batch_channel");
+  DataTamerTest::Attached<DataTamer::DummySink> dummy_sink;
+  channel->addDataSink(dummy_sink);
+
+  int32_t v1 = 0;
+  double v2 = 0;
+  channel->registerValue("v1", &v1);
+  channel->registerValue("v2", &v2);
+  const auto schema_in = channel->getSchema();
+
+  FakeBatchMsg batch;
+  batch.schemas.push_back({ schema_in.hash, schema_in.channel_name, ToStr(schema_in) });
+  for(int i = 0; i < 3; i++)
+  {
+    v1 = i;
+    v2 = 0.5 * i;
+    ASSERT_EQ(channel->takeSnapshot(), DataTamer::SnapshotResult::ok);
+    dummy_sink.drain();
+    const auto snapshot = dummy_sink->latestSnapshot();
+    batch.snapshots.push_back({ uint64_t(snapshot.timestamp.count()),
+                                snapshot.schema_hash, snapshot.active_mask,
+                                snapshot.payload });
+  }
+  // a snapshot whose schema is unknown is skipped
+  batch.snapshots.push_back({ 0, schema_in.hash + 1, {}, {} });
+
+  DataTamerParser::SchemaRegistry registry;
+  std::vector<std::map<std::string, double>> decoded;
+  const size_t visited = DataTamerParser::ForEachSnapshotInBatch(
+      registry, batch,
+      [&](const DataTamerParser::Schema& schema,
+          const DataTamerParser::SnapshotView& view) {
+        EXPECT_EQ(schema.channel_name, "batch_channel");
+        auto& values = decoded.emplace_back();
+        EXPECT_TRUE(DataTamerParser::ParseSnapshot(
+            schema, view,
+            [&](const std::string& name, const DataTamerParser::VarNumber& n) {
+              values[name] = std::visit([](const auto& var) { return double(var); }, n);
+            }));
+      });
+
+  ASSERT_EQ(visited, 3u);
+  ASSERT_EQ(registry.size(), 1u);
+  ASSERT_NE(registry.find(schema_in.hash), nullptr);
+  ASSERT_EQ(decoded.size(), 3u);
+  for(int i = 0; i < 3; i++)
+  {
+    EXPECT_EQ(decoded[size_t(i)].at("v1"), i);
+    EXPECT_EQ(decoded[size_t(i)].at("v2"), 0.5 * i);
+  }
+
+  // without embedded schemas, a registry filled earlier (e.g. from the
+  // `schemas` topic) still decodes the batch
+  batch.schemas.clear();
+  EXPECT_EQ(DataTamerParser::ForEachSnapshotInBatch(registry, batch,
+                                                    [](const auto&, const auto&) {}),
+            3u);
+  DataTamerParser::SchemaRegistry empty_registry;
+  EXPECT_EQ(DataTamerParser::ForEachSnapshotInBatch(empty_registry, batch,
+                                                    [](const auto&, const auto&) {}),
+            0u);
+}
