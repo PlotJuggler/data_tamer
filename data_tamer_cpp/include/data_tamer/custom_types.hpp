@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 
 #include "data_tamer/types.hpp"
 #include "data_tamer/contrib/SerializeMe.hpp"
