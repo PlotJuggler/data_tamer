@@ -109,9 +109,11 @@ DATA_TAMER_UPDATE_GOLDEN=1 \
   `MCAPRingSink::requestDump()`. Tests assert it with `AllocCounter::Scope`
   (`tests/alloc_counter.hpp`): add one when you touch these paths. `takeSnapshot()` may
   block and grow a slot; keep the two variants distinct.
-- `onSchema()`/`onSnapshot()` are serialized by the SinkWorker, and control operations
-  (registration, sinks, `prepare()`) wait for them. Never call a control operation from a
-  sink callback, a serializer or inside `scopedWrite()`.
+- `onSchema()`/`onSnapshot()`/`onStop()` are serialized by the SinkWorker, and control
+  operations (registration, sinks, `prepare()`) wait for them. Never call a control
+  operation from a sink callback, a serializer or inside `scopedWrite()`. `stop()` runs
+  `onStop()` once per stop, after the last delivery; a sink that needs to finish
+  (close, flush, dump) does it there, not in a "call X after stop()" rule.
 - A change to the schema text, the payload encoding, the schema hash or the MCAP and ROS
   message layout is a format revision. Update `docs/wire_format.md`, regenerate the
   vectors, update `python/data_tamer_parser.py` and `data_tamer_parser.hpp`, and bump
@@ -120,8 +122,12 @@ DATA_TAMER_UPDATE_GOLDEN=1 \
 - LogChannel, ChannelsRegistry, SinkWorker, TypesRegistry, MCAPSink, MCAPRingSink and
   ROS2PublisherSink keep all their state behind a Pimpl (LogChannel's only other base is
   `enable_shared_from_this`). Add members to the Pimpl. `tests/abi_tests.cpp` pins the
-  sizes of the sinks, SinkWorker, LogChannel and SnapshotRef. Record any ABI break in the
-  CHANGELOG.
+  sizes of the sinks, SinkWorker, LogChannel, SnapshotRef, DataSink and ChannelDefaults.
+  Record any ABI break in the CHANGELOG.
+- The vtables of `DataSink` and `CustomSerializer` are frozen for 2.x: users derive from
+  them and the library calls through vtables compiled into their binaries. Add no virtual
+  function and no data member; new behaviour goes into non-virtual functions or a
+  separate interface.
 - Only `SnapshotPool::adopt()` builds a SnapshotRef from a pool slot; the constructor is
   private.
 - Include what you use. Headers that only name data_tamer types include `fwd.hpp`, which

@@ -4,6 +4,32 @@ Changelog for package data_tamer
 
 Unreleased
 ----------
+* **Sinks finish themselves**: new ``virtual void DataSink::onStop()``,
+  empty by default. ``SinkWorker::stop()`` calls it on the stopping thread
+  after the last delivery, serialized with the other callbacks, once per stop
+  (a second ``stop()`` without ``start()`` does not call it again; the
+  destructor of a running worker does). A throw is counted in ``errors()``.
+  ``MCAPSink`` closes its file there (**behaviour change**: ``stop()`` now ends
+  the recording; call ``restartRecording()`` before ``start()`` to record
+  again), ``MCAPRingSink`` writes a pending dump (``flushPendingDump()``),
+  ``ROS2PublisherSink`` publishes its partial batch (``flush()``). The "call
+  ``stopRecording()`` / ``flushPendingDump()`` / ``flush()`` after ``stop()``"
+  rules are gone.
+* **ABI**: ``onStop()`` appends a slot to the ``DataSink`` vtable, so sinks
+  compiled against an earlier build must be rebuilt. From 2.0 on, the
+  ``DataSink`` and ``CustomSerializer`` vtables are frozen for 2.x (noted in
+  their headers); ``tests/abi_tests.cpp`` pins ``sizeof(DataSink)`` and
+  ``sizeof(ChannelDefaults)``.
+* ``ChannelsRegistry::stopAll()`` stops, once each, every default sink and
+  every sink attached to a channel the registry created.
+* ``ChannelsRegistry::addDefaultSink()`` also attaches the sink to the
+  channels that exist already (a prepared one announces its schema at once),
+  so it no longer has to come before ``getChannel()``. If a channel refuses the
+  sink, the call is undone and the exception propagates.
+* ``ChannelsRegistry::setChannelDefaults(ChannelDefaults)``: pool capacity (as
+  a count or in time) and payload capacity applied by ``getChannel()`` to the
+  channels it creates afterwards, before the default sinks are attached.
+  Existing channels are not changed. ``clear()`` resets them.
 * **Breaking, sinks**: the shared sink queue is gone, and with it
   ``SinkWorker::kDefaultQueueCapacity`` and the ``queue_capacity`` constructor
   argument: the constructor is ``SinkWorker(std::unique_ptr<DataSink>,
@@ -57,8 +83,8 @@ Unreleased
   completes at the first snapshot stamped after ``T + post_trigger``.
   A writer thread of the sink writes the file from a second buffer, so the
   sink worker never waits for disk; a finished dump that finds the writer busy
-  is handed over at the next snapshot. ``flushPendingDump()`` writes a request
-  made just before ``SinkWorker::stop()``. Dump ``N`` is written to
+  is handed over at the next snapshot. ``SinkWorker::stop()`` writes a request
+  made just before it (``flushPendingDump()``). Dump ``N`` is written to
   ``details::NumberedPath(filepath, N)``, skipping names that exist already.
   The dump callback reports write errors (disk full) and ``truncated`` when
   the ring was too small for the interval. Example ``T04_flight_recorder``.

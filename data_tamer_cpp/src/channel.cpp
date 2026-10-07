@@ -454,6 +454,20 @@ size_t LogChannel::getNumberOfSinks() const
   return count;
 }
 
+std::vector<std::shared_ptr<SinkWorker>> LogChannel::dataSinks() const
+{
+  std::lock_guard const lock(_p->control_mutex);
+  std::vector<std::shared_ptr<SinkWorker>> sinks;
+  for(const auto& link : _p->sinks)
+  {
+    if(link)
+    {
+      sinks.push_back(link->sink);
+    }
+  }
+  return sinks;
+}
+
 Schema LogChannel::getSchema() const
 {
   std::lock_guard const lock(_p->control_mutex);

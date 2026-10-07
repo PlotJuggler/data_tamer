@@ -1,5 +1,6 @@
 #include "data_tamer/channel.hpp"
 #include "data_tamer/data_sink.hpp"
+#include "data_tamer/data_tamer.hpp"
 #include "data_tamer/sinks/mcap_sink.hpp"
 
 #ifdef USING_ROS2
@@ -8,6 +9,8 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <cstddef>
 #include <memory>
 
 using namespace DataTamer;
@@ -67,4 +70,15 @@ TEST(ABI, SinksAreOnlyOnePointerLargerThanTheInterface)
                                                                                      "the"
                                                                                      " AB"
                                                                                      "I");
+}
+
+// DataSink's vtable and layout are frozen for 2.x (see data_sink.hpp): no data
+// members. ChannelDefaults crosses the boundary by value: a layout change needs
+// a SONAME bump.
+TEST(ABI, DataSinkHasNoDataAndChannelDefaultsIsPinned)
+{
+  static_assert(sizeof(DataSink) == sizeof(void*), "DataSink gained a data member");
+  static_assert(sizeof(ChannelDefaults) ==
+                    2 * sizeof(size_t) + 2 * sizeof(std::chrono::nanoseconds),
+                "ChannelDefaults layout is part of the ABI");
 }

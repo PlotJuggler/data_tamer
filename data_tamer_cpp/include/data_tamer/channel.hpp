@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace DataTamer
 {
@@ -366,6 +367,9 @@ public:
 private:
   template <typename T>
   friend class LoggedValue;
+  friend class ChannelsRegistry;
+  /// The attached sinks, for ChannelsRegistry (stopAll, addDefaultSink).
+  [[nodiscard]] std::vector<std::shared_ptr<SinkWorker>> dataSinks() const;
   /// State shared with this channel's LoggedValues (enable flags, write mutex).
   [[nodiscard]] std::shared_ptr<ChannelSharedState> sharedState() const;
 

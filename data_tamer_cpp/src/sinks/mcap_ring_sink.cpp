@@ -539,6 +539,11 @@ bool MCAPRingSink::flushPendingDump()
   return handed_off;
 }
 
+void MCAPRingSink::onStop()
+{
+  (void)flushPendingDump();
+}
+
 void MCAPRingSink::waitForWriter()
 {
   _p->throwIfWriterThread("waitForWriter()");

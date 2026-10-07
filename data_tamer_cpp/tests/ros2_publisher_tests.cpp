@@ -250,6 +250,36 @@ TEST(DataTamerROS2Publisher, AggregateFlushWithoutSchemas)
   EXPECT_TRUE(batch->schemas.empty());
 }
 
+// SinkWorker::stop() publishes the partial batch (DataSink::onStop()).
+TEST(DataTamerROS2Publisher, AggregateStopPublishesThePartialBatch)
+{
+  auto node = std::make_shared<rclcpp::Node>("test_datatamer_aggregate_stop");
+  ROS2PublisherOptions options;
+  options.aggregate = true;
+  options.max_batch_size = 1000;
+  options.max_batch_delay = std::chrono::milliseconds(0);
+  options.embed_schemas = false;
+  auto ros2_sink = ROS2PublisherSink::create(node, "test_aggregate_stop", options);
+
+  auto channel = ChannelsRegistry::Global().getChannel("channel_aggregate_stop");
+  channel->addDataSink(ros2_sink);
+  double const value = 1.;
+  channel->registerValue("value", &value);
+
+  auto batch = receiveBatch(node, "test_aggregate_stop", [&] {
+    for(int i = 0; i < 3; i++)
+    {
+      ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
+    }
+    ros2_sink->stop();  // delivers the 3, then publishes them as one batch
+    ros2_sink->start();
+  });
+
+  ASSERT_TRUE(batch.has_value());
+  EXPECT_EQ(batch->snapshots.size(), 3u);
+  EXPECT_EQ(ros2_sink->errors(), 0u);
+}
+
 TEST(DataTamerROS2Publisher, AggregateByDelay)
 {
   auto node = std::make_shared<rclcpp::Node>("test_datatamer_aggregate_delay");

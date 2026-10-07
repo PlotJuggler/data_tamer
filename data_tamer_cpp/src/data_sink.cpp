@@ -279,6 +279,30 @@ struct SinkWorker::Pimpl
     last_error = what;
   }
 
+  // The sink's onStop(), once per stop, serialized with the other callbacks.
+  void finishSink()
+  {
+    std::lock_guard handoff(handoff_mutex);
+    std::lock_guard lock(store_mutex);
+    if(!sink_running)
+    {
+      return;  // stopped already, and not started since
+    }
+    sink_running = false;
+    try
+    {
+      sink->onStop();
+    }
+    catch(const std::exception& e)
+    {
+      recordError(e.what());
+    }
+    catch(...)
+    {
+      recordError("unknown exception");
+    }
+  }
+
   // One delivery pass; caller holds store_mutex. Returns the number delivered.
   // Allocates nothing: it walks the intrusive list of attachments.
   size_t deliverPass(DataSink& sink)
@@ -391,6 +415,8 @@ struct SinkWorker::Pimpl
   std::mutex handoff_mutex;
   std::mutex store_mutex;
   SnapshotRef current_ref;  // store_mutex
+  // store_mutex: false from onStop() until start().
+  bool sink_running = true;
   // The owned queues, attached and detached-but-not-yet-drained, oldest first.
   // Leaf lock: taken under store_mutex and under LogChannel's control mutex,
   // never the reverse.
@@ -496,10 +522,16 @@ void SinkWorker::stop()
   }
   _p->joinThread();
   drain();
+  _p->finishSink();
 }
 
 void SinkWorker::start()
 {
+  {
+    std::lock_guard handoff(_p->handoff_mutex);
+    std::lock_guard lock(_p->store_mutex);
+    _p->sink_running = true;  // the next stop() calls onStop() again
+  }
   if(_p->delivery == Delivery::Threaded && !_p->thread.joinable())
   {
     _p->startThread(*_p->sink);

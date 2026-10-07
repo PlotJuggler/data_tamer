@@ -195,6 +195,11 @@ void MCAPSink::stopRecording()
   }
 }
 
+void MCAPSink::onStop()
+{
+  stopRecording();
+}
+
 void MCAPSink::restartRecording(const std::string& filepath, bool do_compression)
 {
   restartRecordingImpl(filepath, do_compression, true);

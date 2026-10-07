@@ -153,6 +153,11 @@ void ROS2PublisherSink::onSnapshot(const SnapshotRef& ref)
   _p->data_publisher->publish(_p->data_msg);
 }
 
+void ROS2PublisherSink::onStop()
+{
+  flush();
+}
+
 void ROS2PublisherSink::flush()
 {
   std::lock_guard lock(_p->mutex);

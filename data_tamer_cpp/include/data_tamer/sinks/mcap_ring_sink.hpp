@@ -110,8 +110,10 @@ struct MCAPRingStats
  * memcpy of up to capacity_bytes.
  *
  * Shutdown. A request made just before shutdown has no snapshot left to
- * trigger it: call flushPendingDump() after SinkWorker::stop(). The destructor
- * finishes the file being written but does not start a pending dump.
+ * trigger it: SinkWorker::stop() (and the worker's destructor) writes it with
+ * flushPendingDump() once the last snapshot is delivered, and waits for the
+ * writer. The sink's own destructor finishes the file being written but does
+ * not start a pending dump.
  */
 class MCAPRingSink : public DataSink
 {
@@ -146,9 +148,10 @@ public:
    * @brief Write the active request, if any, with what the ring holds now,
    * and wait until it is on disk. A request no snapshot has triggered yet uses
    * the newest snapshot timestamp seen as trigger; a dump still waiting for
-   * its post-trigger interval is cut at the newest timestamp seen. Call it after
-   * SinkWorker::stop() (or between drain() calls with manual delivery).
-   * Never call it from the dump callback (std::logic_error).
+   * its post-trigger interval is cut at the newest timestamp seen.
+   * SinkWorker::stop() calls it after the last delivery; call it yourself only
+   * while no snapshot is delivered, e.g. between drain() calls with manual
+   * delivery. Never call it from the dump callback (std::logic_error).
    * Returns true if it wrote a dump (see MCAPRingDump::ok for the outcome).
    * In every case it returns after the writer has finished all dumps handed
    * to it so far.
@@ -169,6 +172,8 @@ public:
 protected:
   void onSchema(const Schema& schema) override;
   void onSnapshot(const SnapshotRef& snapshot) override;
+  /// Writes a pending dump, as flushPendingDump().
+  void onStop() override;
 
 private:
   struct Pimpl;

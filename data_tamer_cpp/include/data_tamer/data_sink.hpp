@@ -74,7 +74,7 @@ private:
 };
 
 /**
- * @brief Interface implemented by a sink. The two callbacks are invoked only by
+ * @brief Interface implemented by a sink. The callbacks are invoked only by
  * the SinkWorker that owns the sink and are serialized with each other, so a
  * sink needs no lock of its own for the state they touch:
  *
@@ -83,6 +83,11 @@ private:
  * - onSnapshot() runs on the worker thread (or in drain()), in the order each
  *   channel took its snapshots. Throw to report a failure: the worker counts
  *   it and keeps the message (see SinkWorker).
+ * - onStop() runs on the thread calling SinkWorker::stop() (or destroying the
+ *   worker), after the last snapshot has been delivered: the place to close a
+ *   file, publish a partial batch or write a pending dump. It runs once per
+ *   stop: a second stop() without start() in between does not call it again.
+ *   A throw is counted like one from onSnapshot(). The default does nothing.
  *
  * Keep onSnapshot() short. Every queued or retained SnapshotRef holds a slot of
  * the channel's snapshot pool, which all sinks of that channel share
@@ -99,6 +104,12 @@ private:
  * A callback may use the channel's const queries (getSchema(), stats(), ...)
  * but must never call anything that changes it (registration, sinks,
  * prepare()): those wait for callbacks to finish and would deadlock.
+ *
+ * ABI: the virtual functions below are frozen for 2.x. The library calls them
+ * through vtables compiled into user binaries, so adding, removing or
+ * reordering one breaks every sink built against an earlier 2.x release.
+ * New behaviour arrives as non-virtual functions of SinkWorker or as a
+ * separate interface; DataSink keeps no data members.
  */
 class DataSink
 {
@@ -109,6 +120,7 @@ protected:
   friend class SinkWorker;
   virtual void onSchema(const Schema& schema) = 0;
   virtual void onSnapshot(const SnapshotRef& snapshot) = 0;
+  virtual void onStop() {}
 };
 
 /**
@@ -162,10 +174,15 @@ public:
   }
 
   /// Stop accepting snapshots, wait for the callback in progress, join the
-  /// worker thread and deliver everything still queued. Idempotent. Never call
-  /// it from a callback.
+  /// worker thread, deliver everything still queued, then call the sink's
+  /// onStop() on this thread (MCAPSink closes its file, MCAPRingSink writes a
+  /// pending dump, ROS2PublisherSink publishes its partial batch). Idempotent:
+  /// calling it again before start() does not call onStop() a second time.
+  /// The destructor calls it. Never call it from a callback.
   void stop();
-  /// Resume after stop(): reopen admission and restart the worker thread.
+  /// Resume after stop(): reopen admission and restart the worker thread. The
+  /// sink is not told; a sink that finished itself in onStop() needs its own
+  /// restart (e.g. MCAPSink::restartRecording()) before start().
   void start();
   /// Deliver every snapshot queued so far on the calling thread. Returns after
   /// a callback in progress on the worker has finished, so everything taken
@@ -182,7 +199,8 @@ public:
     return dynamic_cast<T&>(sink());
   }
 
-  /// Number of onSnapshot() calls that threw, and the message of the last one.
+  /// Number of onSnapshot() and onStop() calls that threw, and the message of
+  /// the last one.
   [[nodiscard]] uint64_t errors() const;
   [[nodiscard]] std::string lastError() const;
 
