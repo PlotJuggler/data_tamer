@@ -2,12 +2,17 @@
 #include "data_tamer/details/snapshot_pool.hpp"
 #include "alloc_counter.hpp"
 #include "test_sinks.hpp"
+#include "../examples/geometry_types.hpp"
 
 #include <gtest/gtest.h>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 using namespace DataTamer;
 
@@ -91,7 +96,6 @@ TEST(ChannelCapacity, PrepareWithoutSinkReservesAndRejectsSetters)
   channel->setPoolCapacity(2);
   channel->prepare();  // Explicit preparation freezes even without sinks.
   EXPECT_TRUE(channel->isPrepared());
-  EXPECT_TRUE(GetBit(channel->getActiveFlags(), 0));
   EXPECT_THROW(channel->setPoolCapacity(2), std::runtime_error);
   EXPECT_THROW(channel->setPayloadCapacity(256), std::runtime_error);
   value->set(std::vector<double>(1024, 3.0));
@@ -412,4 +416,170 @@ TEST(ChannelCapacity, AutomaticMinimumAndTryDropRecoverAfterShrink)
   EXPECT_EQ(channel->tryTakeSnapshot(), SnapshotResult::ok);
   EXPECT_EQ(channel->droppedOversize(), 1u);
   EXPECT_EQ(channel->payloadReallocations(), 0u);
+}
+
+namespace
+{
+/// Snapshots a prepared channel accepts before its pool is exhausted, with
+/// nothing delivered: the pool capacity.
+size_t acceptedUntilExhausted(LogChannel& channel)
+{
+  size_t accepted = 0;
+  while(channel.tryTakeSnapshot() == SnapshotResult::ok)
+  {
+    ++accepted;
+  }
+  EXPECT_EQ(channel.tryTakeSnapshot(), SnapshotResult::pool_exhausted);
+  return accepted;
+}
+}  // namespace
+
+TEST(ChannelCapacity, PoolSizedInTimeIsTheCeilingOfStallOverPeriod)
+{
+  using std::chrono::microseconds;
+  using std::chrono::milliseconds;
+  using std::chrono::nanoseconds;
+  const auto slots = [](nanoseconds stall, nanoseconds period) {
+    uint64_t value = 1;
+    CapacityWorker sink;
+    auto channel = LogChannel::create("timed");
+    channel->registerValue("value", &value);
+    channel->addDataSink(sink);
+    channel->setPoolCapacity(stall, period);
+    channel->prepare();
+    return acceptedUntilExhausted(*channel);
+  };
+  EXPECT_EQ(slots(milliseconds(200), milliseconds(1)), 200u);
+  EXPECT_EQ(slots(milliseconds(9), milliseconds(3)), 3u);   // exact
+  EXPECT_EQ(slots(milliseconds(10), milliseconds(3)), 4u);  // 3.33 rounds up
+  EXPECT_EQ(slots(microseconds(1), milliseconds(1)), 1u);   // under one period
+  EXPECT_EQ(slots(nanoseconds::max(), nanoseconds::max()), 1u);
+  EXPECT_EQ(slots(nanoseconds::max(), nanoseconds::max() - nanoseconds(1)), 2u);
+}
+
+TEST(ChannelCapacity, PoolSizedInTimeValidatesItsArguments)
+{
+  using std::chrono::milliseconds;
+  using std::chrono::nanoseconds;
+  uint64_t value = 1;
+  CapacityWorker sink;
+  auto channel = LogChannel::create("timed");
+  channel->registerValue("value", &value);
+  channel->addDataSink(sink);
+  channel->setPoolCapacity(3);
+  EXPECT_THROW(channel->setPoolCapacity(nanoseconds(0), milliseconds(1)),
+               std::invalid_argument);
+  EXPECT_THROW(channel->setPoolCapacity(milliseconds(1), nanoseconds(0)),
+               std::invalid_argument);
+  EXPECT_THROW(channel->setPoolCapacity(milliseconds(-1), milliseconds(1)),
+               std::invalid_argument);
+  EXPECT_THROW(channel->setPoolCapacity(milliseconds(1), milliseconds(-1)),
+               std::invalid_argument);
+  // About 9.2e18 slots: too many, and computed without overflowing on the way.
+  EXPECT_THROW(channel->setPoolCapacity(nanoseconds::max(), nanoseconds(1)),
+               std::length_error);
+  channel->prepare();  // the failed calls kept the capacity set before
+  EXPECT_EQ(acceptedUntilExhausted(*channel), 3u);
+  EXPECT_THROW(channel->setPoolCapacity(milliseconds(10), milliseconds(1)),
+               std::runtime_error);
+}
+
+TEST(ChannelCapacity, FixedSizeSchemaReservesExactlyItsFullPayload)
+{
+  CapacityWorker sink;
+  auto channel = LogChannel::create("exact");
+  double scalar = 1;
+  std::array<float, 3> array{};
+  std::atomic<int32_t> atomic{ 0 };
+  TestTypes::Pose pose;
+  auto scalar_id = channel->registerValue("scalar", &scalar);
+  channel->registerValue("array", &array);
+  channel->registerValue("atomic", &atomic);
+  channel->registerValue("pose", &pose);
+  constexpr size_t kFull = 8 + 3 * 4 + 4 + 7 * 8;
+  // Disabled at prepare(): its bytes are still reserved, for when it comes back.
+  channel->setEnabled(scalar_id, false);
+  channel->addDataSink(sink);
+  channel->prepare();
+  ASSERT_EQ(channel->tryTakeSnapshot(), SnapshotResult::ok);
+  sink.deliver();
+  EXPECT_EQ(sink->last->payload.size(), kFull - 8);
+  EXPECT_EQ(sink->last->payload.capacity(), kFull);
+  sink.drain();
+  channel->setEnabled(scalar_id, true);
+  for(int i = 0; i < 4; ++i)  // every slot
+  {
+    ASSERT_EQ(channel->tryTakeSnapshot(), SnapshotResult::ok);
+    sink.deliver();
+    EXPECT_EQ(sink->last->payload.size(), kFull);
+    EXPECT_EQ(sink->last->payload.capacity(), kFull);
+    sink.drain();
+  }
+  EXPECT_EQ(channel->droppedOversize(), 0u);
+  EXPECT_EQ(channel->payloadReallocations(), 0u);
+}
+
+namespace ReserveTypes
+{
+struct VariableSample
+{
+  double a = 0;
+  std::vector<int32_t> v;
+};
+
+template <typename AddField>
+std::string_view TypeDefinition(VariableSample& sample, AddField& add)
+{
+  add("a", &sample.a);
+  add("v", &sample.v);
+  return "VariableSample";
+}
+}  // namespace ReserveTypes
+
+TEST(ChannelCapacity, PayloadReserveRulePerSchemaKind)
+{
+  const auto reserved = [](auto&& setup, size_t hint) {
+    CapacityWorker sink;
+    auto channel = LogChannel::create("reserve");
+    setup(*channel);
+    channel->setPayloadCapacity(hint);
+    channel->setPoolCapacity(1);
+    channel->addDataSink(sink);
+    channel->prepare();
+    EXPECT_EQ(channel->tryTakeSnapshot(), SnapshotResult::ok);
+    sink.deliver();
+    return sink->last->payload.capacity();
+  };
+  static double a = 1, b = 2;
+  static std::vector<double> dynamic(100);
+  const auto fixed = [](LogChannel& channel) {
+    channel.registerValue("a", &a);
+    channel.registerValue("b", &b);
+  };
+  const auto mixed = [](LogChannel& channel) {
+    channel.registerValue("a", &a);
+    channel.registerValue("dynamic", &dynamic);
+  };
+  const auto with_unregistered = [](LogChannel& channel) {
+    channel.registerValue("a", &a);
+    channel.unregister(channel.registerValue("b", &b));  // its size is not known
+  };
+  EXPECT_EQ(reserved(fixed, 0), 16u);                 // exact
+  EXPECT_EQ(reserved(fixed, 1000), 1000u);            // the hint is a floor
+  EXPECT_EQ(reserved(mixed, 0), 2u * (8 + 4 + 800));  // twice, for growth
+  EXPECT_EQ(reserved(mixed, 4096), 4096u);
+  EXPECT_EQ(reserved(with_unregistered, 0), 256u);  // the dynamic minimum
+
+  // A custom type with a variable-size member, alone or in a std::array: its
+  // serializer is not fixed-size, so the reserve is twice the payload.
+  static ReserveTypes::VariableSample variable{ 1.0, std::vector<int32_t>(100) };
+  static std::array<ReserveTypes::VariableSample, 2> variables{ variable, variable };
+  const auto custom_variable = [](LogChannel& channel) {
+    channel.registerValue("variable", &variable);
+  };
+  const auto array_of_variable = [](LogChannel& channel) {
+    channel.registerValue("variables", &variables);
+  };
+  EXPECT_EQ(reserved(custom_variable, 0), 2u * (8 + 4 + 400));
+  EXPECT_EQ(reserved(array_of_variable, 0), 2u * 2 * (8 + 4 + 400));
 }

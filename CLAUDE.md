@@ -35,7 +35,7 @@ under "Unreleased" in `data_tamer_cpp/CHANGELOG.rst`.
   - `tests/`: one gtest binary, `datatamer_test`, plus compile-only targets.
   - `examples/`: T01 to T04, `mcap_1m_per_sec`, `mcap_reader`, `ros2_publisher` (ROS only).
   - `benchmarks/`: built only when Google Benchmark is found.
-  - `3rdparty/`: vendored moodycamel ConcurrentQueue and MCAP.
+  - `3rdparty/`: vendored MCAP.
 - `data_tamer_msgs/`: ROS 2 messages `Schema`, `Schemas`, `Snapshot`, `SnapshotBatch`.
 - `python/`: `data_tamer_parser.py`, the reference decoder (standard library only),
   packaged as `data-tamer-parser`; its tests; `ros2_subscriber.py`.
@@ -103,7 +103,8 @@ DATA_TAMER_UPDATE_GOLDEN=1 \
   -Werror`.
 - The real-time path allocates nothing, takes no blocking lock, does no I/O and does not
   throw. It covers `tryTakeSnapshot()` and what it reaches (`SnapshotPool::tryAcquire`,
-  `WriteMutex::tryLockWithSpin`, `ValuePtr` serialization, `SinkWorker::tryPush`),
+  `WriteMutex::tryLockWithSpin`, `ValuePtr` serialization, `SinkWorker::tryPush` and
+  its per-channel single-producer queue),
   scalar `LoggedValue::set()`/`get()`, `trySetEnabled()` and
   `MCAPRingSink::requestDump()`. Tests assert it with `AllocCounter::Scope`
   (`tests/alloc_counter.hpp`): add one when you touch these paths. `takeSnapshot()` may
@@ -117,9 +118,12 @@ DATA_TAMER_UPDATE_GOLDEN=1 \
   `SCHEMA_VERSION` or `SCHEMA_YAML_VERSION` in `types.hpp` when the text changes. The
   `WireFormat.*` tests and the Python tests fail until all of them agree.
 - LogChannel, ChannelsRegistry, SinkWorker, TypesRegistry, MCAPSink, MCAPRingSink and
-  ROS2PublisherSink keep their state behind a Pimpl. Add members to the Pimpl.
-  `tests/abi_tests.cpp` pins the sizes of the sinks, SinkWorker and SnapshotRef. Record
-  any ABI break in the CHANGELOG.
+  ROS2PublisherSink keep all their state behind a Pimpl (LogChannel's only other base is
+  `enable_shared_from_this`). Add members to the Pimpl. `tests/abi_tests.cpp` pins the
+  sizes of the sinks, SinkWorker, LogChannel and SnapshotRef. Record any ABI break in the
+  CHANGELOG.
+- Only `SnapshotPool::adopt()` builds a SnapshotRef from a pool slot; the constructor is
+  private.
 - Include what you use. Headers that only name data_tamer types include `fwd.hpp`, which
   must declare each type with the same class or struct key as its definition (the
   `fwd_header_*` targets check it). `data_tamer.hpp` includes only `fwd.hpp`, so code

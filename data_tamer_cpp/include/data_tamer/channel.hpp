@@ -54,10 +54,10 @@ enum class SnapshotResult : uint8_t
 {
   /// Captured and accepted by every attached sink.
   ok,
-  /// Captured; some sinks accepted it, others refused (queue full or worker
-  /// stopped). droppedSnapshots(sink) tells which.
+  /// Captured; some sinks accepted it, others refused it because their
+  /// SinkWorker is stopped. droppedSnapshots(sink) tells which.
   partial,
-  /// Captured, but every attached sink refused it.
+  /// Captured, but every attached sink refused it (every SinkWorker stopped).
   rejected,
   /// No sink is attached: nothing captured. Before prepare() this also leaves
   /// the schema open.
@@ -212,12 +212,16 @@ public:
    * @brief addDataSink attaches a sink (a SinkWorker owning a DataSink, see
    * MCAPSink::create or SinkWorker::create<T>) that will receive our snapshots.
    * A channel holds at most eight sinks; adding a ninth throws. Adding the
-   * same sink twice is a no-op.
+   * same sink twice is a no-op. On a prepared channel it allocates the
+   * channel's queue on that sink (as many entries as pool slots) and calls
+   * onSchema(); otherwise prepare() does both.
    */
   void addDataSink(std::shared_ptr<SinkWorker> sink);
 
   /**
    * @brief removeDataSink remove a sink, i.e. a class collecting our snapshots.
+   * Snapshots the channel already queued on it are still delivered, before any
+   * it publishes after attaching the sink again; then the queue is freed.
    */
   void removeDataSink(std::shared_ptr<SinkWorker> sink);
 
@@ -262,23 +266,13 @@ public:
    * library itself performs no allocation and no blocking acquisition on this
    * path: it spins on the write mutex for its budget and returns `blocked`
    * instead of waiting, sizes the payload against the slot and returns
-   * `oversize` instead of growing it, and publishes through lock-free queues.
+   * `oversize` instead of growing it, and publishes into one wait-free
+   * single-producer queue per sink, sized like the pool so that it never fills.
    * What custom serializers do inside serializedSize()/serialize() is up to
    * them: on this path they must not throw, allocate or block.
    */
   [[nodiscard]] SnapshotResult
   tryTakeSnapshot(std::chrono::nanoseconds timestamp = NsecSinceEpoch());
-
-  /**
-   * @brief getActiveFlags returns a serialized buffer, where
-   * each bit represents if a series is enabled or not.
-   * Therefore the vector size will be ceiling(series_count/8).
-   *
-   * Even if technically we may use vector<bool>, this data structure
-   * is already serialized. This snapshot-thread-only view is the last rebuilt
-   * mask, valid until the next snapshot or channel destruction.
-   */
-  [[nodiscard]] const ActiveMask& getActiveFlags();
 
   /**
    * @brief getSchema. See description of class Schema
@@ -325,12 +319,29 @@ public:
   /// Snapshot attempts that could not acquire a free pool slot.
   [[nodiscard]] uint64_t poolExhausted() const;
 
-  /// Configure before prepare(). Each slot reserves
-  /// max(bytes, 2 * initial payload size, 256); zero is automatic.
+  /// Minimum payload bytes each pool slot reserves; configure before prepare().
+  /// prepare() reserves at least this much, and more when the schema needs it:
+  /// exactly the payload with every value enabled when all registered values
+  /// are fixed-size (scalars, std::array, fixed-size custom types), otherwise
+  /// max(2 x payload size at prepare(), 256). Zero (the default) is automatic.
   void setPayloadCapacity(size_t bytes);
 
-  /// Number of retained/in-flight snapshots; default 64. Zero is invalid.
+  /// Number of pool slots, i.e. snapshots that may be queued in or retained by
+  /// sinks at the same time; default 64 (SnapshotPool::kDefaultCapacity).
+  /// Configure before prepare(). Zero is invalid. Each attached sink gets a
+  /// queue of the same size, so the pool is the only bound on in-flight
+  /// snapshots.
   void setPoolCapacity(size_t count);
+
+  /// Pool sized in time: enough slots to absorb a sink stall of
+  /// `stall_tolerance` while snapshots are taken every `snapshot_period`, i.e.
+  /// ceil(stall_tolerance / snapshot_period). Configure before prepare(). Both
+  /// arguments must be positive (std::invalid_argument, checked first); a
+  /// result too large for setPoolCapacity(count) throws std::length_error, and
+  /// a call after prepare() throws std::runtime_error, like the count overload.
+  /// Example: 200 ms at 1 kHz gives 200 slots.
+  void setPoolCapacity(std::chrono::nanoseconds stall_tolerance,
+                       std::chrono::nanoseconds snapshot_period);
 
   /// Successful per-slot payload growth allocations by takeSnapshot().
   [[nodiscard]] uint64_t payloadReallocations() const;
@@ -362,7 +373,9 @@ private:
   SnapshotResult takeSnapshotImpl(std::chrono::nanoseconds timestamp, bool real_time);
   std::unique_ptr<Pimpl> _p;
 
-  TypesRegistry _type_registry;
+  /// The channel's custom-type serializers, kept in the Pimpl. Control path only
+  /// (registration templates); the snapshot path never uses it.
+  TypesRegistry& typeRegistry();
 
   std::mutex& controlMutex();
   bool schemaFrozen() const;
@@ -451,7 +464,7 @@ inline void LogChannel::updateTypeRegistry()
       }
       return;
     }
-    if(auto added_serializer = _type_registry.addType<T>(type_name, true))
+    if(auto added_serializer = typeRegistry().addType<T>(type_name, true))
     {
       auto func = [this, &fields](const char* field_name, const auto* member) {
         using MemberType =
@@ -481,7 +494,7 @@ inline RegistrationID LogChannel::registerValue(const std::string& name,
   else
   {
     updateTypeRegistry<T>();
-    auto def = _type_registry.getSerializer<T>();
+    auto def = typeRegistry().getSerializer<T>();
     return registerValueImpl(name, ValuePtr(value_ptr, def), def);
   }
 }
@@ -524,7 +537,7 @@ inline RegistrationID LogChannel::registerValue(const std::string& prefix,
   else
   {
     updateTypeRegistry<T>();
-    auto def = _type_registry.getSerializer<T>();
+    auto def = typeRegistry().getSerializer<T>();
     return registerValueImpl(prefix, ValuePtr(vect), def);
   }
 }
@@ -543,7 +556,7 @@ inline RegistrationID LogChannel::registerValue(const std::string& prefix,
   else
   {
     updateTypeRegistry<T>();
-    auto def = _type_registry.getSerializer<T>();
+    auto def = typeRegistry().getSerializer<T>();
     return registerValueImpl(prefix, ValuePtr(vect, def), def);
   }
 }

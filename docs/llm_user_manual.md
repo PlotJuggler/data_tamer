@@ -31,8 +31,8 @@ target_link_libraries(my_app PRIVATE data_tamer::data_tamer)
 flowchart LR
   V["your variables<br/>registerValue / LoggedValue"] --> C["LogChannel"]
   C -- "takeSnapshot()<br/>tryTakeSnapshot()" --> P["snapshot pool<br/>(per channel)"]
-  P -- "SnapshotRef" --> Q1["SinkWorker queue + thread"]
-  P -- "SnapshotRef" --> Q2["SinkWorker queue + thread"]
+  P -- "SnapshotRef" --> Q1["channel queue<br/>SinkWorker thread"]
+  P -- "SnapshotRef" --> Q2["channel queue<br/>SinkWorker thread"]
   Q1 --> S1["DataSink::onSnapshot<br/>e.g. MCAPSink"]
   Q2 --> S2["DataSink::onSnapshot<br/>e.g. ROS2PublisherSink"]
 ```
@@ -43,13 +43,17 @@ flowchart LR
 - `LogChannel` (`data_tamer/channel.hpp`) holds pointers to registered variables. It
   reads them only when you take a snapshot. One channel is one schema and one rate: use
   several channels for several loops or rates.
-- `prepare()` freezes the schema, allocates a pool of snapshot slots and announces the
-  schema to every attached sink (`DataSink::onSchema()`).
+- `prepare()` freezes the schema, allocates a pool of snapshot slots plus one queue per
+  attached sink, as long as the pool, and announces the schema to every attached sink
+  (`DataSink::onSchema()`).
 - `takeSnapshot()` or `tryTakeSnapshot()` serializes every enabled value into a free pool
-  slot and pushes a reference (`SnapshotRef`) into the queue of each attached sink. The
-  slot returns to the pool when the last sink releases its reference.
-- `SinkWorker` (`data_tamer/data_sink.hpp`) owns one `DataSink`, its queue and the thread
-  that calls `onSnapshot()`. Channels take sinks as `std::shared_ptr<SinkWorker>`.
+  slot and pushes a reference (`SnapshotRef`) into the channel's queue on each attached
+  sink. The slot returns to the pool when the last sink releases its reference. A queued
+  reference holds a slot, so a queue can't fill while the pool has a free slot: the pool
+  is the only bound.
+- `SinkWorker` (`data_tamer/data_sink.hpp`) owns one `DataSink`, the queues of the
+  channels attached to it and the thread that calls `onSnapshot()`. Channels take sinks
+  as `std::shared_ptr<SinkWorker>`.
 
 ## Headers
 
@@ -133,7 +137,7 @@ int main()
   channel->registerValue("cycle_time_ms", &cycle_time_ms);
   auto mode = channel->createLoggedValue<int32_t>("mode");  // RAII, atomic
 
-  channel->setPoolCapacity(128);  // before prepare()
+  channel->setPoolCapacity(200ms, 1ms);  // absorb a 200 ms sink stall at 1 kHz
   channel->prepare();             // freeze schema, allocate pool, announce
 
   uint64_t lost = 0;
@@ -151,8 +155,8 @@ int main()
     {
       case SnapshotResult::ok:
         break;
-      case SnapshotResult::partial:         // a sink queue was full
-      case SnapshotResult::rejected:        // every sink refused
+      case SnapshotResult::partial:         // a sink was stopped
+      case SnapshotResult::rejected:        // every sink was stopped
       case SnapshotResult::pool_exhausted:  // sinks hold every slot
       case SnapshotResult::blocked:         // a writer held scopedWrite()
       case SnapshotResult::oversize:        // payload outgrew the slot
@@ -379,8 +383,10 @@ Call `channel->prepare()` once, after registration and before the loop, on a non
 real-time thread. It:
 
 - freezes the schema;
-- allocates the snapshot pool: `setPoolCapacity()` slots (default 64), each reserving
-  `max(setPayloadCapacity() bytes, 2 x the payload size at prepare(), 256)` bytes;
+- allocates the snapshot pool: `setPoolCapacity()` slots (default 64), each reserving the
+  payload bytes described in [Payload capacity](#payload-capacity-per-slot);
+- allocates, for each attached sink, a queue holding as many references as the pool has
+  slots (24 bytes each). A sink attached later gets its queue in `addDataSink()`;
 - calls `onSchema()` of every attached sink on the calling thread. `MCAPSink` registers
   the MCAP channel, and `ROS2PublisherSink` publishes the schema catalog over DDS.
 
@@ -406,8 +412,8 @@ Both return a `[[nodiscard]] SnapshotResult`. Cast to `(void)` to ignore it on p
 | Result | Meaning | What to do |
 |---|---|---|
 | `ok` | Captured and queued by every sink. | Nothing. |
-| `partial` | Captured, but some sinks refused it (queue full or worker stopped). | Check `droppedSnapshots(sink)`; size the queue, see [Sizing](#sizing-for-real-time). |
-| `rejected` | Captured, but every sink refused it. | Same as `partial`; check whether sinks were stopped. |
+| `partial` | Captured, but some sinks refused it because their `SinkWorker` is stopped. | Check `droppedSnapshots(sink)`; `start()` the worker or detach it. |
+| `rejected` | Captured, but every sink refused it (every worker stopped). | Same as `partial`. |
 | `no_sinks` | No sink attached; nothing captured. Before `prepare()` the schema stays open. | Attach a sink. |
 | `not_prepared` | `tryTakeSnapshot()` before `prepare()`; nothing captured. | Call `prepare()` first. |
 | `pool_exhausted` | Sinks still hold every pool slot; the sample is lost for every sink. | Raise `setPoolCapacity()`, or fix the slow sink. |
@@ -437,12 +443,16 @@ methods with `worker->as<T>()`, which throws `std::bad_cast` for the wrong type.
   afterwards by `getChannel()`. Call it before creating the channels.
 - `SinkWorker::stop()` stops accepting snapshots, waits for the callback in progress and
   delivers everything still queued. It is idempotent and never callable from a callback.
-  `start()` resumes. `drain()` delivers the queue on the calling thread.
+  `start()` resumes. `drain()` delivers the queues on the calling thread.
+- Each channel's snapshots reach `onSnapshot()` in the order they were taken. The worker
+  serves its channels in turn, so snapshots of different channels interleave in no
+  guaranteed order. `removeDataSink()` (or destroying the channel) lets the worker
+  deliver what that channel had queued, then frees the queue.
 - `SinkWorker::errors()` counts `onSnapshot()` calls that threw; `lastError()` returns the
   last message.
-- `SinkWorker(std::unique_ptr<DataSink>, queue_capacity = 1024, Delivery::Threaded)`
-  builds a worker by hand, to choose the queue capacity or `Delivery::Manual` (no thread:
-  you call `drain()`).
+- `SinkWorker(std::unique_ptr<DataSink>, Delivery::Threaded)` builds a worker by hand, to
+  choose `Delivery::Manual` (no thread: you call `drain()`). There is no queue size to
+  set.
 
 ### MCAPSink
 
@@ -511,7 +521,7 @@ recorder.flushPendingDump();
   merged.
 - Trigger: the first snapshot the sink receives after the request, with time `T`. The
   file holds the stored snapshots of all channels stamped in
-  `[T - window, T + post_trigger]`. Delivery runs behind the producer when the queue is
+  `[T - window, T + post_trigger]`. Delivery runs behind the producer when the queues are
   backed up, so `T` can be later than the snapshot taken when you called
   `requestDump()`.
 - The dump completes at the first delivered snapshot stamped after `T + post_trigger`.
@@ -590,7 +600,8 @@ Derive from `DataTamer::DataSink` and implement the two protected callbacks:
 
 - `onSchema(const Schema&)` runs on the thread that prepares the channel or attaches the
   sink, once per channel schema.
-- `onSnapshot(const SnapshotRef&)` runs on the worker thread, in queue order.
+- `onSnapshot(const SnapshotRef&)` runs on the worker thread, in the order each channel
+  took its snapshots.
 - The worker serializes the two callbacks, so state touched only by them needs no lock.
   `stop()` runs before the sink's destructor.
 - Throw to report a failure: the worker counts it in `errors()` and goes on.
@@ -659,8 +670,7 @@ private:
   std::thread thread_;
 };
 
-// Attach it with an explicit queue capacity:
-auto slow = std::make_shared<DataTamer::SinkWorker>(std::make_unique<SlowSink>(), 4096);
+auto slow = DataTamer::SinkWorker::create<SlowSink>();
 channel->addDataSink(slow);
 ```
 
@@ -670,41 +680,40 @@ layout.
 
 ## Sizing for real time
 
-Three bounded resources sit between the loop and the sinks. When one runs out, the
-snapshot is dropped and counted; nothing blocks.
+Two bounded resources sit between the loop and the sinks. When one runs out, the
+snapshot is dropped and counted; nothing blocks. The queues between a channel and its
+sinks are sized from the pool and never fill.
 
 ### Snapshot pool (per channel)
 
 Every snapshot queued in any sink, or retained by one, holds a slot. The default is 64
-slots (`SnapshotPool::kDefaultCapacity`): 64 ms at 1 kHz. Size it for the snapshot rate
-times the longest sink stall you accept, for example 200 slots for a 1 kHz channel whose
-MCAP sink can stall 200 ms on a disk flush. Set it with `setPoolCapacity(count)` before
-`prepare()`. Memory is about `pool slots x slot bytes`.
+slots (`SnapshotPool::kDefaultCapacity`): 64 ms at 1 kHz. Size it in time, before
+`prepare()`:
+
+```cpp
+channel->setPoolCapacity(200ms, 1ms);  // ceil(200 ms / 1 ms) = 200 slots
+```
+
+`setPoolCapacity(stall_tolerance, snapshot_period)` takes the longest sink stall you
+accept (an MCAP disk flush can take 200 ms) and the snapshot period, and sets
+`ceil(stall_tolerance / snapshot_period)` slots. Both must be positive.
+`setPoolCapacity(count)` sets the count directly. Memory is about
+`pool slots x (slot bytes + 24 x attached sinks)`.
 
 ### Payload capacity (per slot)
 
-Each slot reserves `max(setPayloadCapacity(bytes), 2 x payload size at prepare(), 256)`
-bytes. Scalars take `sizeof(T)`, a `std::array` takes its elements, and a
-`std::vector` takes 4 bytes of length plus its elements. If vectors grow at run time past
-the slot, `tryTakeSnapshot()` returns `oversize` and `takeSnapshot()` reallocates the
-slot. Call `setPayloadCapacity()` with the largest payload you expect.
+Scalars take `sizeof(T)`, a `std::array` takes its elements, and a `std::vector` takes 4
+bytes of length plus its elements. `prepare()` reserves, per slot:
 
-### Sink queue (per SinkWorker)
+- when every registered value is fixed-size (scalars, `std::array`, custom types whose
+  serializer is fixed-size): exactly the payload with every value enabled, so a value
+  disabled at `prepare()` still fits when enabled later;
+- otherwise (a `std::vector` or a variable-size custom type is registered, or a value was
+  unregistered before `prepare()`): `max(2 x payload size at prepare(), 256)`.
 
-The queue holds `queue_capacity` references (default 1024,
-`SinkWorker::kDefaultQueueCapacity`), preallocated in blocks of 32 and shared by every
-channel attached to that sink. Each channel keeps the blocks it has used once until the
-SinkWorker is destroyed. A channel that bursts first can take every block, and the other
-channels' snapshots are then refused (`partial` or `rejected`) even when the queue is
-empty. A channel never has more references in flight than its pool slots, so size:
-
-```text
-queue_capacity >= sum over attached channels of (pool slots + 2 x 32)
-```
-
-The default 1024 covers eight channels with the default pool of 64. The `create()`
-helpers use the default; build the `SinkWorker` by hand for another capacity, as in the
-custom sink example.
+`setPayloadCapacity(bytes)` raises that reservation to at least `bytes`. If vectors grow
+at run time past the slot, `tryTakeSnapshot()` returns `oversize` and `takeSnapshot()`
+reallocates the slot. Call `setPayloadCapacity()` with the largest payload you expect.
 
 ### Counters to watch
 
@@ -717,7 +726,7 @@ take the channel's control mutex).
 | `oversize` results | `stats().dropped_oversize` or `droppedOversize()` |
 | `takeSnapshot()` grew a slot | `stats().payload_reallocations` |
 | Writers delayed snapshots | `stats().write_lock_contended`, `stats().write_lock_wait_max_ns` |
-| `partial` or `rejected` results | `channel->droppedSnapshots(worker)`, per attached sink |
+| `partial` or `rejected` results (stopped worker) | `channel->droppedSnapshots(worker)`, per attached sink |
 | A sink failed to write | `worker->errors()`, `worker->lastError()` |
 | Flight recorder too small | `MCAPRingSink::stats().evicted_by_capacity`, `MCAPRingDump::truncated` |
 
@@ -795,8 +804,6 @@ MCAP file with it.
 - [ ] Used `takeSnapshot()` on a real-time thread: use `tryTakeSnapshot()`.
 - [ ] Ignored `SnapshotResult` and never read `stats()`: drops stay invisible.
 - [ ] Kept the default pool (64 ms at 1 kHz) with a sink that stalls longer.
-- [ ] Attached many channels to one sink with the default queue: size it as in
-      [Sink queue](#sink-queue-per-sinkworker).
 - [ ] Did slow work or called a mutating channel API inside `onSnapshot()`.
 - [ ] Set `data_qos` to `KeepAll` for `ROS2PublisherSink` in a robot process: a slow
       subscriber then grows the publisher's memory without bound.

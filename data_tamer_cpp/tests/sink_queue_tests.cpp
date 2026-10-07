@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 #include <mcap/reader.hpp>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -14,7 +15,9 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 using namespace DataTamer;
 using DataTamerTest::attach;
@@ -39,10 +42,9 @@ public:
   std::atomic<int> registrations{ 0 };
 };
 
-Attached<QueueSink> queueSink(size_t capacity = 1024,
-                              Delivery delivery = Delivery::Manual)
+Attached<QueueSink> queueSink(Delivery delivery = Delivery::Manual)
 {
-  return attach<QueueSink>(delivery, capacity);
+  return attach<QueueSink>(delivery);
 }
 
 std::shared_ptr<LogChannel> channelWith(const std::shared_ptr<SinkWorker>& sink,
@@ -79,36 +81,38 @@ TEST(SinkQueue, RetainedSnapshotOutlivesChannelAndQueue)
   EXPECT_TRUE(GetBit(retained->active_mask, 0));
 }
 
-TEST(SinkQueue, QueueOverflowReleasesFailedFanoutWithoutExhaustingPool)
+TEST(SinkQueue, RefusedFanoutReleasesItsReferenceWithoutExhaustingPool)
 {
   uint64_t value = 1;
-  auto small = queueSink(1);
-  auto large = queueSink();
-  auto channel = channelWith(small, &value);
-  channel->addDataSink(small);  // Must keep the existing producer token.
-  channel->addDataSink(large);
+  auto stopped = queueSink();
+  auto running = queueSink();
+  auto channel = channelWith(stopped, &value);
+  channel->addDataSink(stopped);  // already attached: a no-op
+  channel->addDataSink(running);
   int received = 0;
-  large->callback = [&](const SnapshotRef&) { ++received; };
+  running->callback = [&](const SnapshotRef&) { ++received; };
   for(int i = 0; i < 32; ++i)
   {
     ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
   }
-  EXPECT_EQ(small->registrations.load(), 1);
-  large.drain();
-  for(int i = 0; i < 160; ++i)
+  EXPECT_EQ(stopped->registrations.load(), 1);
+  running.drain();
+  stopped.worker->stop();  // delivers its 32, then refuses
+  // Three times the pool: a refused clone that kept its slot would exhaust it.
+  for(int i = 0; i < 192; ++i)
   {
     EXPECT_EQ(channel->takeSnapshot(), SnapshotResult::partial);
-    large.drain();
+    running.drain();
   }
-  EXPECT_EQ(received, 192);
-  EXPECT_EQ(channel->droppedSnapshots(small), 160u);
-  EXPECT_EQ(channel->droppedSnapshots(large), 0u);
+  EXPECT_EQ(received, 224);
+  EXPECT_EQ(channel->droppedSnapshots(stopped), 192u);
+  EXPECT_EQ(channel->droppedSnapshots(running), 0u);
   EXPECT_EQ(channel->poolExhausted(), 0u);
-  small.drain();
+  stopped.worker->start();
   EXPECT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
   // Callbacks capture locals declared after the workers: stop before they die.
-  small.worker->stop();
-  large.worker->stop();
+  stopped.worker->stop();
+  running.worker->stop();
 }
 
 TEST(SinkQueue, PoolExhaustionIsSeparateAndRetainedSlotsAreReusable)
@@ -134,46 +138,42 @@ TEST(SinkQueue, PoolExhaustionIsSeparateAndRetainedSlotsAreReusable)
   sink.worker->stop();  // delivers the last one while `retained` is still alive
 }
 
-TEST(SinkQueue, FixedPayloadFanoutAndOverflowDoNotAllocate)
+TEST(SinkQueue, FixedPayloadFanoutAndRefusalDoNotAllocate)
 {
   uint64_t value = 1;
-  auto small = queueSink(1);
-  auto large = queueSink();
-  auto channel = channelWith(small, &value);
-  channel->addDataSink(large);
-  ASSERT_EQ(channel->takeSnapshot(),
-            SnapshotResult::ok);  // Creates the pool and registers schemas.
+  auto stopped = queueSink();
+  auto running = queueSink();
+  auto channel = channelWith(stopped, &value);
+  channel->addDataSink(running);
+  channel->prepare();  // Creates the pool and the queues, registers schemas.
   size_t allocations = 0, deallocations = 0;
-  int successes = 0, failures = 0;
+  int successes = 0, partials = 0;
   {
     DataTamerTest::AllocCounter::Scope scope;
-    for(int i = 0; i < 200; ++i)
-    {
-      if(channel->takeSnapshot() == SnapshotResult::ok)
-      {
-        ++successes;
-      }
-      else
-      {
-        ++failures;
-      }
-      large.drain();
-    }
-    small.drain();
     for(int i = 0; i < 100; ++i)
     {
-      if(channel->takeSnapshot() == SnapshotResult::ok)
-      {
-        ++successes;
-      }
-      small.drain();
-      large.drain();
+      successes += channel->tryTakeSnapshot() == SnapshotResult::ok;
+      stopped.drain();
+      running.drain();
+    }
+    stopped.worker->stop();  // Manual delivery: no thread to join
+    for(int i = 0; i < 200; ++i)
+    {
+      partials += channel->tryTakeSnapshot() == SnapshotResult::partial;
+      running.drain();
+    }
+    stopped.worker->start();
+    for(int i = 0; i < 100; ++i)
+    {
+      successes += channel->tryTakeSnapshot() == SnapshotResult::ok;
+      stopped.drain();
+      running.drain();
     }
     allocations = scope.allocations();
     deallocations = scope.deallocations();
   }
-  EXPECT_GT(successes, 100);
-  EXPECT_GT(failures, 100);
+  EXPECT_EQ(successes, 200);
+  EXPECT_EQ(partials, 200);
   EXPECT_EQ(allocations, 0u);
   EXPECT_EQ(deallocations, 0u);
   EXPECT_EQ(channel->poolExhausted(), 0u);
@@ -184,7 +184,7 @@ TEST(SinkQueue, ExceptionsReleaseReferencesAndDoNotStopDelivery)
   for(bool worker : { false, true })
   {
     uint64_t value = 1;
-    auto sink = queueSink(1024, worker ? Delivery::Threaded : Delivery::Manual);
+    auto sink = queueSink(worker ? Delivery::Threaded : Delivery::Manual);
     auto channel = channelWith(sink, &value);
     std::mutex mutex;
     std::condition_variable delivered;
@@ -222,7 +222,7 @@ TEST(SinkQueue, ExceptionsReleaseReferencesAndDoNotStopDelivery)
 
 TEST(SinkQueue, WorkerAndManualDrainerSerializeCallbacksAndPreserveProducerOrder)
 {
-  auto sink = queueSink(1024, Delivery::Threaded);
+  auto sink = queueSink(Delivery::Threaded);
   uint64_t a = 0, b = 0;
   auto first = channelWith(sink, &a, "first");
   auto second = channelWith(sink, &b, "second");
@@ -274,7 +274,7 @@ TEST(SinkQueue, WorkerAndManualDrainerSerializeCallbacksAndPreserveProducerOrder
 
 TEST(SinkQueue, StopDuringPublicationDrainsEveryAcceptedSnapshot)
 {
-  auto sink = queueSink(1024, Delivery::Threaded);
+  auto sink = queueSink(Delivery::Threaded);
   uint64_t value = 0;
   auto channel = channelWith(sink, &value);
   std::mutex mutex;
@@ -340,29 +340,22 @@ TEST(SinkQueue, StopDuringPublicationDrainsEveryAcceptedSnapshot)
 TEST(SinkQueue, RejectedWhenEverySinkRefusesPartialWhenSomeDo)
 {
   uint64_t value = 1;
-  auto stopped = queueSink(1024, Delivery::Threaded);
-  auto full = queueSink(1);
-  auto channel = channelWith(stopped, &value);
+  auto first = queueSink(Delivery::Threaded);
+  auto second = queueSink();
+  auto channel = channelWith(first, &value);
+  channel->addDataSink(second);
   ASSERT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
-  stopped.worker->stop();  // admission closed: refuses without a full queue
+  first.worker->stop();  // admission closed: the only reason to refuse
+  EXPECT_EQ(channel->takeSnapshot(), SnapshotResult::partial);
+  second.worker->stop();
   EXPECT_EQ(channel->takeSnapshot(), SnapshotResult::rejected);
-  channel->addDataSink(full);
-  // `full` accepts until its (block-rounded) queue fills, then both refuse.
-  SnapshotResult result = SnapshotResult::partial;
-  uint64_t attempts = 0;
-  while(result == SnapshotResult::partial && attempts < 1000)
-  {
-    result = channel->takeSnapshot();
-    ++attempts;
-  }
-  EXPECT_EQ(result, SnapshotResult::rejected);
-  EXPECT_GT(attempts, 1u);
-  EXPECT_EQ(channel->droppedSnapshots(stopped), 1 + attempts);
-  EXPECT_EQ(channel->droppedSnapshots(full), 1u);
-  stopped.worker->start();
-  full.drain();
+  EXPECT_EQ(channel->droppedSnapshots(first), 2u);
+  EXPECT_EQ(channel->droppedSnapshots(second), 1u);
+  first.worker->start();
+  second.worker->start();
   EXPECT_EQ(channel->takeSnapshot(), SnapshotResult::ok);
-  stopped.worker->stop();
+  first.worker->stop();
+  second.worker->stop();
 }
 
 TEST(SinkQueue, WorkerDestructionDeliversQueuedSnapshotsBeforeTheSink)
@@ -415,7 +408,7 @@ TEST(SinkQueue, McapFinalizationWritesEveryAcceptedSnapshotAfterRestart)
   const auto first = (directory / "first.mcap").string();
   const auto second = (directory / "second.mcap").string();
   uint64_t value = 9;
-  auto sink = attach<MCAPSink>(Delivery::Threaded, 1, first, true);
+  auto sink = attach<MCAPSink>(Delivery::Threaded, first, true);
   auto channel = channelWith(sink, &value);
   for(const auto& path : { first, second })
   {
@@ -701,8 +694,8 @@ TEST(SinkQueue, McapRolloverSkipsExistingFiles)
 TEST(SinkQueue, FastConsumerCannotReleaseParentBeforeSecondFanout)
 {
   uint64_t value = 0;
-  auto first = queueSink(1024, Delivery::Threaded);
-  auto second = queueSink(1024, Delivery::Threaded);
+  auto first = queueSink(Delivery::Threaded);
+  auto second = queueSink(Delivery::Threaded);
   auto channel = channelWith(first, &value);
   channel->addDataSink(second);
   channel->setPoolCapacity(2);
@@ -762,4 +755,371 @@ TEST(SinkQueue, McapFailedRestartKeepsTheCurrentRecording)
   EXPECT_EQ(count, 2u);
   reader.close();
   std::filesystem::remove_all(directory);
+}
+
+namespace
+{
+/// Prepared channels on one sink, each logging its own counter, which take()
+/// increments before every snapshot: delivered values grow in channel order.
+struct CountingChannels
+{
+  CountingChannels(const std::shared_ptr<SinkWorker>& sink, size_t count, size_t pool)
+    : counters(count, 0)
+  {
+    for(size_t i = 0; i < count; ++i)
+    {
+      auto channel = LogChannel::create("counting_" + std::to_string(i));
+      channel->registerValue("counter", &counters[i]);
+      channel->setPoolCapacity(pool);
+      channel->addDataSink(sink);
+      channel->prepare();
+      hashes.push_back(channel->getSchema().hash);
+      channels.push_back(channel);
+    }
+  }
+
+  SnapshotResult take(size_t i)
+  {
+    ++counters[i];
+    return channels[i]->tryTakeSnapshot();
+  }
+
+  size_t indexOf(const SnapshotRef& snapshot) const
+  {
+    for(size_t i = 0; i < hashes.size(); ++i)
+    {
+      if(hashes[i] == snapshot->schema_hash)
+      {
+        return i;
+      }
+    }
+    ADD_FAILURE() << "snapshot of an unknown channel";
+    return 0;
+  }
+
+  static uint64_t counterOf(const SnapshotRef& snapshot)
+  {
+    uint64_t counter = 0;
+    std::memcpy(&counter, snapshot->payload.data(), sizeof(counter));
+    return counter;
+  }
+
+  std::vector<uint64_t> counters;  // sized once: channels hold pointers into it
+  std::vector<uint64_t> hashes;
+  std::vector<std::shared_ptr<LogChannel>> channels;
+};
+
+void expectIncreasing(const std::vector<uint64_t>& values, size_t channel)
+{
+  for(size_t k = 1; k < values.size(); ++k)
+  {
+    ASSERT_LT(values[k - 1], values[k]) << "channel " << channel << " entry " << k;
+  }
+}
+}  // namespace
+
+// The pool is the only bound on what a channel can have in flight to a sink:
+// each channel takes every free slot of its pool, then finds the pool
+// exhausted, never a full queue. Several channels share the worker; every
+// round first moves the queue positions by `pad`, so that the queues wrap at
+// every offset; detaching and attaching again with snapshots still queued
+// changes nothing, and keeps per-channel order.
+TEST(SinkQueue, PoolIsTheOnlyBoundAcrossChannelsRoundsAndReattachment)
+{
+  constexpr size_t kChannels = 4;
+  constexpr size_t kPool = 300;
+  auto sink = queueSink();
+  CountingChannels counting(sink, kChannels, kPool);
+  size_t delivered = 0;
+  sink->callback = [&](const SnapshotRef&) { ++delivered; };
+  sink.drain();  // empty: nothing queued before the counted scope
+  size_t allocations = 0, deallocations = 0;
+  {
+    DataTamerTest::AllocCounter::Scope scope;
+    for(size_t pad = 0; pad < 64; ++pad)
+    {
+      for(size_t n = 0; n < pad; ++n)
+      {
+        for(size_t i = 0; i < kChannels; ++i)
+        {
+          ASSERT_EQ(counting.take(i), SnapshotResult::ok);
+        }
+      }
+      sink.drain();
+      for(size_t n = 0; n < kPool; ++n)
+      {
+        for(size_t i = 0; i < kChannels; ++i)
+        {
+          ASSERT_EQ(counting.take(i), SnapshotResult::ok)
+              << "channel " << i << " pad " << pad << " snapshot " << n;
+        }
+      }
+      for(size_t i = 0; i < kChannels; ++i)
+      {
+        ASSERT_EQ(counting.take(i), SnapshotResult::pool_exhausted)
+            << "channel " << i << " pad " << pad;
+      }
+      sink.drain();
+    }
+    allocations = scope.allocations();
+    deallocations = scope.deallocations();
+  }
+  EXPECT_EQ(allocations, 0u);
+  EXPECT_EQ(deallocations, 0u);
+  EXPECT_EQ(delivered, kChannels * (64 * kPool + 63 * 64 / 2));  // pads 0..63
+
+  std::array<std::vector<uint64_t>, kChannels> values;
+  sink->callback = [&](const SnapshotRef& snapshot) {
+    values[counting.indexOf(snapshot)].push_back(CountingChannels::counterOf(snapshot));
+  };
+  constexpr size_t kQueued = 100;
+  for(size_t n = 0; n < kQueued; ++n)
+  {
+    for(size_t i = 0; i < kChannels; ++i)
+    {
+      ASSERT_EQ(counting.take(i), SnapshotResult::ok);
+    }
+  }
+  // Two channels leave and come back with 100 snapshots queued in the old queue,
+  // which still hold their slots: the pool has 200 free, and so does each queue.
+  for(size_t i = 0; i < 2; ++i)
+  {
+    counting.channels[i]->removeDataSink(sink);
+    counting.channels[i]->addDataSink(sink);
+  }
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    for(size_t n = 0; n < kPool - kQueued; ++n)
+    {
+      ASSERT_EQ(counting.take(i), SnapshotResult::ok) << "channel " << i << " " << n;
+    }
+    ASSERT_EQ(counting.take(i), SnapshotResult::pool_exhausted) << "channel " << i;
+  }
+  sink.drain();  // the detached queues first, then the new ones
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    EXPECT_EQ(values[i].size(), kPool) << "channel " << i;
+    expectIncreasing(values[i], i);
+    values[i].clear();
+  }
+  // The old queues are gone; the new ones carry a whole pool again.
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    for(size_t n = 0; n < kPool; ++n)
+    {
+      ASSERT_EQ(counting.take(i), SnapshotResult::ok) << "channel " << i << " " << n;
+    }
+    ASSERT_EQ(counting.take(i), SnapshotResult::pool_exhausted) << "channel " << i;
+  }
+  sink.drain();
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    EXPECT_EQ(values[i].size(), kPool) << "channel " << i;
+    expectIncreasing(values[i], i);
+    EXPECT_EQ(counting.channels[i]->droppedSnapshots(sink), 0u);
+  }
+}
+
+// A control thread detaches and attaches the sink of three channels as fast as
+// it can, and drains alongside the worker thread, while each channel logs from
+// its own thread. Nothing is refused while the worker runs (the pool is the
+// only bound), every accepted snapshot is delivered exactly once, and each
+// channel's snapshots arrive in order. Meant to run under ThreadSanitizer.
+TEST(SinkQueue, AttachAndDetachWhileLoggingKeepEveryAcceptedSnapshotInOrder)
+{
+  constexpr size_t kChannels = 3;
+  constexpr uint64_t kSnapshots = 20000;
+  auto sink = queueSink(Delivery::Threaded);
+  std::array<std::vector<uint64_t>, kChannels> values;  // deliverer only
+  CountingChannels* lookup = nullptr;
+  sink->callback = [&](const SnapshotRef& snapshot) {
+    values[lookup->indexOf(snapshot)].push_back(CountingChannels::counterOf(snapshot));
+  };
+  CountingChannels counting(sink, kChannels, 16);
+  lookup = &counting;  // before the first snapshot, so before the first callback
+  std::array<uint64_t, kChannels> accepted{};
+  std::array<uint64_t, kChannels> refused{};
+  std::atomic<bool> done{ false };
+  std::thread control([&] {
+    while(!done)
+    {
+      for(const auto& channel : counting.channels)
+      {
+        channel->removeDataSink(sink);
+        channel->addDataSink(sink);
+      }
+      sink.drain();
+    }
+  });
+  std::vector<std::thread> producers;
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    producers.emplace_back([&, i] {
+      for(uint64_t n = 0; n < kSnapshots; ++n)
+      {
+        const auto result = counting.take(i);
+        accepted[i] += result == SnapshotResult::ok;
+        refused[i] +=
+            result == SnapshotResult::rejected || result == SnapshotResult::partial;
+      }
+    });
+  }
+  for(auto& producer : producers)
+  {
+    producer.join();
+  }
+  done = true;
+  control.join();
+  sink.worker->stop();
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    EXPECT_EQ(refused[i], 0u) << "channel " << i;
+    EXPECT_GT(accepted[i], 0u) << "channel " << i;
+    EXPECT_EQ(values[i].size(), accepted[i]) << "channel " << i;
+    expectIncreasing(values[i], i);
+  }
+}
+
+// removeDataSink() and addDataSink() of the same worker run on two threads
+// while each channel logs from its own: the queue a removal leaves behind is
+// delivered before the queue of the next attachment, so every channel's
+// snapshots still arrive in order, and every accepted one exactly once.
+TEST(SinkQueue, RemoveAndAddOnDifferentThreadsKeepPerChannelOrder)
+{
+  constexpr size_t kChannels = 2;
+  constexpr uint64_t kSnapshots = 20000;
+  auto sink = queueSink(Delivery::Threaded);
+  std::array<std::vector<uint64_t>, kChannels> values;  // deliverer only
+  CountingChannels* lookup = nullptr;
+  sink->callback = [&](const SnapshotRef& snapshot) {
+    values[lookup->indexOf(snapshot)].push_back(CountingChannels::counterOf(snapshot));
+  };
+  CountingChannels counting(sink, kChannels, 32);
+  lookup = &counting;
+  std::array<uint64_t, kChannels> accepted{};
+  std::atomic<bool> done{ false };
+  std::thread remover([&] {
+    while(!done)
+    {
+      for(const auto& channel : counting.channels)
+      {
+        channel->removeDataSink(sink);
+      }
+    }
+  });
+  std::thread adder([&] {
+    while(!done)
+    {
+      for(const auto& channel : counting.channels)
+      {
+        channel->addDataSink(sink);
+      }
+    }
+  });
+  std::vector<std::thread> producers;
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    producers.emplace_back([&, i] {
+      for(uint64_t n = 0; n < kSnapshots; ++n)
+      {
+        accepted[i] += counting.take(i) == SnapshotResult::ok;
+      }
+    });
+  }
+  for(auto& producer : producers)
+  {
+    producer.join();
+  }
+  done = true;
+  remover.join();
+  adder.join();
+  sink.worker->stop();
+  for(size_t i = 0; i < kChannels; ++i)
+  {
+    EXPECT_EQ(values[i].size(), accepted[i]) << "channel " << i;
+    expectIncreasing(values[i], i);
+  }
+}
+
+// A detached channel's queue is freed by the delivery pass that empties it,
+// not when the worker is destroyed: here a Manual worker's drain() frees the
+// ring's entries and its list node, once.
+TEST(SinkQueue, DrainFreesTheQueueOfADetachedChannel)
+{
+  uint64_t value = 1;
+  auto sink = queueSink();
+  int delivered = 0;
+  sink->callback = [&](const SnapshotRef&) { ++delivered; };
+  auto channel = channelWith(sink, &value);
+  channel->prepare();
+  for(int i = 0; i < 5; ++i)
+  {
+    ASSERT_EQ(channel->tryTakeSnapshot(), SnapshotResult::ok);
+  }
+  channel->removeDataSink(sink);  // frees the link; the queue keeps its 5
+  size_t freed = 0;
+  {
+    DataTamerTest::AllocCounter::Scope scope;
+    sink.drain();
+    freed = scope.deallocations();
+  }
+  EXPECT_EQ(delivered, 5);
+  EXPECT_EQ(freed, 2u);
+  {
+    DataTamerTest::AllocCounter::Scope scope;
+    sink.drain();
+    freed = scope.deallocations();
+  }
+  EXPECT_EQ(freed, 0u);
+  // An empty queue goes at the next pass too.
+  channel->addDataSink(sink);
+  channel->removeDataSink(sink);
+  {
+    DataTamerTest::AllocCounter::Scope scope;
+    sink.drain();
+    freed = scope.deallocations();
+  }
+  EXPECT_EQ(freed, 2u);
+  EXPECT_EQ(delivered, 5);
+}
+
+// Lost wake-up stress: one snapshot at a time to a Threaded worker, each
+// waited for with a timeout. The pauses before each push straddle the worker's
+// polling window (about 20 us), so pushes land while it polls, while it marks
+// itself asleep and while it sleeps. Not deterministic: a lost wake-up shows as
+// a timeout on some round. Meant to run under ThreadSanitizer too.
+TEST(SinkQueue, EverySnapshotWakesAnIdleWorker)
+{
+  uint64_t value = 0;
+  auto sink = queueSink(Delivery::Threaded);
+  std::mutex mutex;
+  std::condition_variable condition;
+  uint64_t delivered = 0;
+  sink->callback = [&](const SnapshotRef&) {
+    {
+      std::lock_guard lock(mutex);
+      ++delivered;
+    }
+    condition.notify_all();
+  };
+  auto channel = channelWith(sink, &value);
+  channel->prepare();
+  using std::chrono::microseconds;
+  const std::array<microseconds, 6> pauses{ microseconds(0),  microseconds(5),
+                                            microseconds(18), microseconds(22),
+                                            microseconds(40), microseconds(100) };
+  constexpr uint64_t kRounds = 20000;
+  for(uint64_t n = 1; n <= kRounds; ++n)
+  {
+    const auto until = std::chrono::steady_clock::now() + pauses[n % pauses.size()];
+    while(std::chrono::steady_clock::now() < until)
+    {
+    }
+    ASSERT_EQ(channel->tryTakeSnapshot(), SnapshotResult::ok);
+    std::unique_lock lock(mutex);
+    ASSERT_TRUE(
+        condition.wait_for(lock, std::chrono::seconds(5), [&] { return delivered == n; }))
+        << "round " << n;
+  }
+  sink.worker->stop();
 }

@@ -3,13 +3,17 @@
 #include "data_tamer/contrib/SerializeMe.hpp"
 #include "data_tamer/details/shared_state.hpp"
 #include "data_tamer/details/snapshot_pool.hpp"
-#include "ConcurrentQueue/concurrentqueue.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace DataTamer
 {
@@ -38,6 +42,7 @@ struct LogChannel::Pimpl
     ValuePtr holder;
   };
   std::string channel_name;
+  TypesRegistry type_registry;  // control_mutex
   mutable std::mutex control_mutex;
   std::vector<ValueHolder> series;
   std::unordered_map<std::string, size_t> registered_values;
@@ -118,11 +123,62 @@ struct LogChannel::Pimpl
     return size;
   }
 
+  // Per-slot payload reservation made by prepare(); caller holds write_mutex
+  // with the mask rebuilt. When every value is fixed-size, exactly the payload
+  // with all of them enabled (one disabled now may be enabled later). Otherwise
+  // twice the current payload and at least 256 bytes, so that containers can
+  // grow before tryTakeSnapshot() reports `oversize`. payload_capacity is a floor.
+  size_t initialPayloadCapacity() const
+  {
+    size_t all_values = 0;
+    for(const auto& value : series)
+    {
+      if(!value.holder.isFixedSize())
+      {
+        return std::max({ payload_capacity, checkedDouble(payloadSize()), size_t(256) });
+      }
+      const auto size = value.holder.getSerializedSize();
+      if(size > std::vector<uint8_t>().max_size() - all_values)
+      {
+        throw std::length_error("Snapshot payload is too large");
+      }
+      all_values += size;
+    }
+    return std::max(payload_capacity, all_values);
+  }
+
   struct SinkLink
   {
-    // Members are destroyed in reverse order: token must die before its sink.
+    explicit SinkLink(std::shared_ptr<SinkWorker> worker) : sink(std::move(worker)) {}
+    ~SinkLink() { dropQueue(); }
+    SinkLink(const SinkLink&) = delete;
+    SinkLink& operator=(const SinkLink&) = delete;
+
+    /// Give the link a queue on its worker as large as the pool, unless it
+    /// already has one: the pool never changes size while a link holds a queue,
+    /// because a failed prepare() drops the queues with the pool. Control path:
+    /// allocates, may throw (link unchanged).
+    void ensureQueue(size_t pool_capacity)
+    {
+      if(!queue)
+      {
+        queue = sink->attach(pool_capacity);
+      }
+    }
+
+    /// End the attachment: the worker still delivers what it holds, then frees it.
+    void dropQueue() noexcept
+    {
+      if(queue)
+      {
+        sink->detach(queue);
+        queue = nullptr;
+      }
+    }
+
     std::shared_ptr<SinkWorker> sink;
-    std::unique_ptr<moodycamel::ProducerToken> token;
+    // Set once the pool exists; every published link has one.
+    SinkWorker::Attachment* queue = nullptr;
     std::atomic<uint64_t> dropped{ 0 };
     bool schema_registered = false;
   };
@@ -260,6 +316,13 @@ LogChannel::~LogChannel()
     }
     _p->waitQuiescent();
     links = std::move(_p->sinks);
+    for(auto& link : links)
+    {
+      if(link)
+      {
+        link->dropQueue();  // noexcept, no lock, no callback
+      }
+    }
   }
 }
 
@@ -325,9 +388,7 @@ void LogChannel::addDataSink(std::shared_ptr<SinkWorker> sink)
   {
     return;
   }
-  auto link = std::make_unique<Pimpl::SinkLink>();
-  link->sink = sink;
-  link->token = link->sink->makeProducerToken();
+  auto link = std::make_unique<Pimpl::SinkLink>(sink);
   if(_p->schema_frozen)
   {
     // Same protocol as prepare(): the sink hears a copy of the final schema
@@ -343,7 +404,12 @@ void LogChannel::addDataSink(std::shared_ptr<SinkWorker> sink)
       return;  // attached concurrently by someone else
     }
   }
-  // Neither a throwing token allocation nor onSchema can publish a partial link.
+  if(_p->pool)
+  {
+    // A prepared channel: the queue is sized like the pool, allocated here.
+    link->ensureQueue(_p->pool->capacity());
+  }
+  // Neither a throwing queue allocation nor onSchema can publish a partial link.
   _p->sinks[*free_slot] = std::move(link);
   if(_p->logging_started.load(std::memory_order_relaxed))
   {
@@ -367,6 +433,10 @@ void LogChannel::removeDataSink(std::shared_ptr<SinkWorker> sink)
         _p->published_sinks[i].store(nullptr, std::memory_order_seq_cst);
         _p->waitQuiescent();
         removed = std::move(_p->sinks[i]);
+        // Detach before unlocking: an addDataSink() of the same worker on
+        // another thread then attaches its new queue after this detach, and the
+        // worker delivers the old queue first (per-channel order).
+        removed->dropQueue();
         break;
       }
     }
@@ -449,6 +519,24 @@ void LogChannel::setPoolCapacity(size_t count)
   _p->pool_capacity = count;
 }
 
+void LogChannel::setPoolCapacity(std::chrono::nanoseconds stall_tolerance,
+                                 std::chrono::nanoseconds snapshot_period)
+{
+  if(stall_tolerance.count() <= 0 || snapshot_period.count() <= 0)
+  {
+    throw std::invalid_argument("Pool capacity: stall tolerance and snapshot period "
+                                "must be positive");
+  }
+  // ceil(stall / period) without the overflow of (stall + period - 1) / period.
+  const auto whole = stall_tolerance.count() / snapshot_period.count();
+  const bool remainder = stall_tolerance.count() % snapshot_period.count() != 0;
+  if(static_cast<uint64_t>(whole) >= std::numeric_limits<size_t>::max())
+  {
+    throw std::length_error("Snapshot pool capacity is too large");
+  }
+  setPoolCapacity(static_cast<size_t>(whole) + (remainder ? 1 : 0));
+}
+
 uint64_t LogChannel::payloadReallocations() const
 {
   return _p->payload_reallocations.load(std::memory_order_relaxed);
@@ -494,6 +582,11 @@ void LogChannel::checkValueName(const std::string& name) const
   }
 }
 
+TypesRegistry& LogChannel::typeRegistry()
+{
+  return _p->type_registry;
+}
+
 std::mutex& LogChannel::controlMutex()
 {
   return _p->control_mutex;
@@ -505,11 +598,6 @@ bool LogChannel::schemaFrozen() const
 bool LogChannel::hasCustomType(const std::string& type_name) const
 {
   return _p->schema.custom_types.contains(type_name);
-}
-
-const ActiveMask& LogChannel::getActiveFlags()
-{
-  return _p->active_mask;
 }
 
 bool LogChannel::isPrepared() const
@@ -537,11 +625,19 @@ void LogChannel::prepare()
       _p->active_mask.resize(_p->series.size() / 8 + (_p->series.size() % 8 != 0));
       _p->shared->mask_dirty.exchange(false, std::memory_order_seq_cst);
       _p->rebuildMask();
-      const auto capacity = std::max(
-          { _p->payload_capacity, checkedDouble(_p->payloadSize()), size_t(256) });
+      const auto capacity = _p->initialPayloadCapacity();
       // Publish the pool only after every slot has reserved successfully.
       _p->pool = std::make_shared<SnapshotPool>(_p->pool_capacity, capacity,
                                                 _p->active_mask.size());
+    }
+    // One queue per attached sink, as large as the pool; links attached later
+    // get theirs in addDataSink().
+    for(auto& link : _p->sinks)
+    {
+      if(link)
+      {
+        link->ensureQueue(_p->pool->capacity());
+      }
     }
     // Announce to one sink at a time with the control mutex released: a sink
     // may query the channel from onSchema(), and other control operations
@@ -571,6 +667,13 @@ void LogChannel::prepare()
     }
     _p->schema_frozen = was_frozen;
     _p->pool.reset();
+    for(auto& link : _p->sinks)
+    {
+      if(link)
+      {
+        link->dropQueue();  // never published, so empty
+      }
+    }
     throw;
   }
   for(size_t i = 0; i < _p->sinks.size(); ++i)
@@ -624,7 +727,7 @@ SnapshotResult LogChannel::takeSnapshotImpl(std::chrono::nanoseconds timestamp,
   {
     return SnapshotResult::pool_exhausted;
   }
-  SnapshotRef parent(_p->pool, slot);
+  SnapshotRef parent = SnapshotPool::adopt(_p->pool, slot);
   auto& snapshot = slot->snapshot;
 
   {
@@ -696,7 +799,7 @@ SnapshotResult LogChannel::takeSnapshotImpl(std::chrono::nanoseconds timestamp,
       continue;
     }
     ++attached;
-    if(link->sink->tryPush(*link->token, parent.clone()))
+    if(link->sink->tryPush(*link->queue, parent.clone()))
     {
       ++accepted;
     }

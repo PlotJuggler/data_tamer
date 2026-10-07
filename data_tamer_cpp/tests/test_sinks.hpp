@@ -35,24 +35,19 @@ struct Attached
   T* sink;
 };
 
-/// Worker with an explicit delivery mode and queue capacity. Manual delivery
-/// makes tests deterministic: snapshots are delivered only by drain().
+/// Worker with an explicit delivery mode. Manual delivery makes tests
+/// deterministic: snapshots are delivered only by drain().
 template <typename T, typename... Args>
-Attached<T> attach(DataTamer::SinkWorker::Delivery delivery,
-                   size_t capacity = DataTamer::SinkWorker::kDefaultQueueCapacity,
-                   Args&&... args)
+Attached<T> attach(DataTamer::SinkWorker::Delivery delivery, Args&&... args)
 {
   return Attached<T>(std::make_shared<DataTamer::SinkWorker>(
-      std::make_unique<T>(std::forward<Args>(args)...), capacity, delivery));
+      std::make_unique<T>(std::forward<Args>(args)...), delivery));
 }
 
 template <typename T, typename... Args>
 Attached<T> manual(Args&&... args)
 {
-  return Attached<T>(std::make_shared<DataTamer::SinkWorker>(
-      std::make_unique<T>(std::forward<Args>(args)...),
-      DataTamer::SinkWorker::kDefaultQueueCapacity,
-      DataTamer::SinkWorker::Delivery::Manual));
+  return attach<T>(DataTamer::SinkWorker::Delivery::Manual, std::forward<Args>(args)...);
 }
 
 /// True while the calling thread (or any other) holds the channel's write mutex:

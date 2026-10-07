@@ -36,7 +36,7 @@ or publish it using an inter-process communication, for instance, a ROS2 publish
 
 You can easily create your own, specialized sinks: implement `DataTamer::DataSink`
 (two callbacks, `onSchema` and `onSnapshot`) and wrap it with `SinkWorker::create<MySink>()`,
-which owns the delivery queue and thread. See `data_tamer/sinks/dummy_sink.hpp` for a small one.
+which owns the delivery thread and the queues of the channels attached to it. See `data_tamer/sinks/dummy_sink.hpp` for a small one.
 
 Headers that only name DataTamer types (a `LogChannel&` parameter, a `std::shared_ptr<SinkWorker>`
 member, ...) can include `data_tamer/fwd.hpp` instead of the full headers. Like `<iosfwd>`, it
@@ -82,8 +82,12 @@ on a real-time thread.
 
 - One thread per channel calls `takeSnapshot()`. `prepare()` freezes the schema, pre-allocates
   a pool of 64 snapshots and announces the schema to the sinks; the first `takeSnapshot()` with
-  sinks attached calls it for you. Tune beforehand with `setPoolCapacity()` and
+  sinks attached calls it for you. Tune beforehand with `setPoolCapacity()`, in slots or in
+  time (`setPoolCapacity(200ms, 1ms)` absorbs a 200 ms sink stall at 1 kHz), and
   `setPayloadCapacity()`.
+- The pool is the only bound on snapshots in flight. Each sink gets one queue per channel,
+  as long as the pool, so a snapshot is refused (`partial`, `rejected`) only by a stopped
+  `SinkWorker`. There is no queue size to configure.
 - `takeSnapshot()` returns a `SnapshotResult` (`ok`, `partial`, `rejected`, `no_sinks`,
   `pool_exhausted`, ...). It may wait for a writer holding the mutex and grows a slot whose
   payload no longer fits. `tryTakeSnapshot()` is the real-time variant: the library does no
