@@ -171,7 +171,9 @@ One version number covers the C++ library, the ROS packages and the Python decod
   commit renames it to `x.y.z (date)`.
 
 `tools/check_versions.py` compares them and runs as the ctest case `version_consistency`.
-Change them together.
+Change them together. It also checks that the Python package links the wire format of
+its own tag (`blob/x.y.z/docs/wire_format.md` in `python/README.md` and
+`python/pyproject.toml`, the PyPI page): update those links with the version.
 
 The SOVERSION is the ABI generation. Within one major version a newer
 `libdata_tamer.so` must keep working with consumers built against any older header of
@@ -249,6 +251,18 @@ sink is not covered: its ABI also follows the rclcpp release, and its pins are i
 frozen vtables); once a 2.x tag exists the label no longer works and only a major
 version bump passes. The check also runs on pushes to `V2`, against the previous
 commit.
+
+### Releasing
+
+1. Release commit on `V2`: rename the CHANGELOG head section from "Unreleased" to
+   `x.y.z (date)`; `python3 tools/check_versions.py --tag x.y.z` must pass.
+2. Push the tag `x.y.z` (no `v` prefix). The `python` workflow reruns that check on the
+   tag, builds the sdist and wheel and publishes `data-tamer-parser` to PyPI.
+3. Once, before the first release: on pypi.org add a pending trusted publisher for the
+   project `data-tamer-parser` (owner `PlotJuggler`, repository `data_tamer`, workflow
+   `python.yml`, environment `pypi`), and create the environment `pypi` in the GitHub
+   repository settings (optionally with required reviewers, so a person approves each
+   upload).
 
 ## Conventions
 

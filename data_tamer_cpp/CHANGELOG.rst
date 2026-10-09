@@ -178,8 +178,10 @@ Unreleased
   still standard library only, importable as ``data_tamer_parser``; version
   ``data_tamer_parser.__version__``): ``pip install ./python``. The ``python``
   workflow tests and builds it and publishes it to PyPI on ``X.Y.Z`` tags; it
-  is versioned in lockstep with the library (release tag == ``package.xml``
-  version == ``data_tamer_parser.__version__``). New
+  is versioned in lockstep with the library: the workflow publishes only if
+  ``tools/check_versions.py --tag X.Y.Z`` passes (every version equals the tag,
+  the CHANGELOG head is that release, and the PyPI page links the wire format
+  of that tag). New
   ``Schema.field_names()`` lists the flattened names from the schema alone
   (dynamic vector elements as the placeholder ``vec[]``; bounded by
   ``MAX_SCHEMA_DEPTH`` and ``MAX_FIELD_NAMES``), and ``iter_mcap(path)`` yields
