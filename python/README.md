@@ -2,8 +2,8 @@
 
 Reference decoder for the [Data Tamer](https://github.com/PlotJuggler/data_tamer)
 wire format, specified in
-[docs/wire_format.md](https://github.com/PlotJuggler/data_tamer/blob/V2/docs/wire_format.md)
-(the V2 branch, until it is merged).
+[docs/wire_format.md](https://github.com/PlotJuggler/data_tamer/blob/2.0.0/docs/wire_format.md)
+(of this release).
 A single module, `data_tamer_parser`, using the Python standard library only.
 
 ```
@@ -47,10 +47,10 @@ for undefined or cyclic types, nesting deeper than the decoder accepts
 
 ## Versions and releases
 
-The package is released together with the C++ library: a release tag, the
-`package.xml` versions and `data_tamer_parser.__version__` are the same `X.Y.Z`. The
-`python` workflow publishes to PyPI only for tags of that form, and fails if the tag
-differs from `__version__`.
+The package is released together with the C++ library and has the same version
+`X.Y.Z`. The `python` workflow publishes to PyPI only for a release tag of that form,
+and only if every version number in the repository, the CHANGELOG head section and the
+wire-format link above all match the tag (`tools/check_versions.py --tag X.Y.Z`).
 
 ## Lower level
 
